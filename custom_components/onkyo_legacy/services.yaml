@@ -1,0 +1,24 @@
+refresh:
+  name: Refresh
+  description: Refresh the current state from the Onkyo processor.
+  fields:
+    entity_id:
+      required: false
+      selector:
+        entity:
+          integration: onkyo_legacy
+
+set_listening_mode:
+  name: Set listening mode
+  description: Set the processor listening mode.
+  fields:
+    entity_id:
+      required: false
+      selector:
+        entity:
+          integration: onkyo_legacy
+    listening_mode:
+      required: true
+      example: stereo
+      selector:
+        text:
