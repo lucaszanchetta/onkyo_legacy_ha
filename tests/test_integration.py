@@ -156,6 +156,32 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             registry.async_get_entity_id("switch", "onkyo_legacy", "192.168.1.23-zone3-mute")
         )
 
+
+    async def test_setup_entry_does_not_fail_when_initial_refresh_times_out(self) -> None:
+        entry = self.init_module.ConfigEntry(
+            entry_id="entry-1",
+            data={
+                "host": "192.168.1.23",
+                "port": 60128,
+                "name": "Onkyo PR-SC5507",
+                "model": "PR-SC5507",
+                "scan_interval": 10,
+                "max_volume": 80,
+                "sources": {"HTPC": "vcr"},
+            },
+        )
+
+        result = await self.init_module.async_setup_entry(self.hass, entry)
+
+        self.assertTrue(result)
+        runtime = self.hass.data["onkyo_legacy"][entry.entry_id]
+        self.assertEqual(runtime.coordinator.command_capabilities["LMD"], True)
+        self.assertGreaterEqual(len(self.hass.created_tasks), 1)
+
+        refresh_task = self.hass.created_tasks[0]
+        await refresh_task
+        self.assertFalse(runtime.coordinator.last_update_success)
+
     async def test_services_registration_and_routing(self) -> None:
         runtime = type("Runtime", (), {})()
         runtime.entity_ids = {"media_player.onkyo_pr_sc5507"}

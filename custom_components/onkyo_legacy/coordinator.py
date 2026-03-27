@@ -274,6 +274,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self.source_raw_to_name = source_raw_to_name
         self.source_name_to_raw = source_name_to_raw
         self.command_capabilities: dict[str, bool] = {}
+        self.data = OnkyoState()
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
