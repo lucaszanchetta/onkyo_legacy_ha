@@ -119,27 +119,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         max_volume=entry.data[CONF_MAX_VOLUME],
     )
 
-    try:
-        await runtime.coordinator.async_refresh()
-    except Exception as err:
-        _LOGGER.error(
-            "Failed to reach Onkyo device %s:%s: %s",
-            entry.data[CONF_HOST],
-            entry.data[CONF_PORT],
-            err,
-        )
-        return False
-
-    if not runtime.coordinator.last_update_success:
-        _LOGGER.error(
-            "Initial state refresh failed for %s:%s",
-            entry.data[CONF_HOST],
-            entry.data[CONF_PORT],
-        )
-        return False
-
     for command in runtime.queryable_commands:
         runtime.coordinator.set_command_capability(command, True)
+
+    hass.async_create_task(_async_initial_refresh(runtime))
 
     runtime.zones = (runtime, *runtime.candidate_zones)
 
@@ -149,6 +132,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     hass.bus.async_listen_once("homeassistant_stop", lambda _event: _disconnect_all(hass))
     return True
+
+
+async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
+    """Perform a best-effort first refresh without blocking setup."""
+    try:
+        await runtime.coordinator.async_refresh()
+    except Exception as err:
+        _LOGGER.warning(
+            "Initial state refresh failed for %s:%s: %s",
+            runtime.host,
+            runtime.port,
+            err,
+        )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
