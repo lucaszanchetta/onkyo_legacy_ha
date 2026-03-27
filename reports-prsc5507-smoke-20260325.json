@@ -1,0 +1,176 @@
+{
+  "host": "192.168.1.23",
+  "port": 60128,
+  "queries": [
+    {
+      "command": "PWR",
+      "response": "PWR01",
+      "result": "queryable"
+    },
+    {
+      "command": "MVL",
+      "response": "MVL00",
+      "result": "queryable"
+    },
+    {
+      "command": "AMT",
+      "response": "AMT00",
+      "result": "queryable"
+    },
+    {
+      "command": "SLI",
+      "response": "SLI00",
+      "result": "queryable"
+    },
+    {
+      "command": "SLA",
+      "response": "SLA00",
+      "result": "queryable"
+    },
+    {
+      "command": "LMD",
+      "response": "LMD81",
+      "result": "queryable"
+    },
+    {
+      "command": "DIM",
+      "response": "DIM02",
+      "result": "queryable"
+    },
+    {
+      "command": "SLP",
+      "response": "SLP00",
+      "result": "queryable"
+    },
+    {
+      "command": "CTL",
+      "response": "CTL00",
+      "result": "queryable"
+    },
+    {
+      "command": "SWL",
+      "response": "SWL+1",
+      "result": "queryable"
+    },
+    {
+      "command": "SW2",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "TGA",
+      "response": "TGA00",
+      "result": "queryable"
+    },
+    {
+      "command": "TGB",
+      "response": "TGB01",
+      "result": "queryable"
+    },
+    {
+      "command": "TGC",
+      "response": "TGC01",
+      "result": "queryable"
+    },
+    {
+      "command": "PMB",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "LTN",
+      "response": "LTN00",
+      "result": "queryable"
+    },
+    {
+      "command": "RAS",
+      "response": "RAS00",
+      "result": "queryable"
+    },
+    {
+      "command": "ADQ",
+      "response": "ADQ00",
+      "result": "queryable"
+    },
+    {
+      "command": "ADV",
+      "response": "ADV00",
+      "result": "queryable"
+    },
+    {
+      "command": "MOT",
+      "response": "MOT00",
+      "result": "queryable"
+    },
+    {
+      "command": "AVS",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "PBS",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "SBS",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "HAO",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "HAS",
+      "error": "",
+      "response": null,
+      "result": "assertion_failure"
+    },
+    {
+      "command": "CEC",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "ARC",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    },
+    {
+      "command": "RES",
+      "response": "RES06",
+      "result": "queryable"
+    },
+    {
+      "command": "HDO",
+      "response": "HDO04",
+      "result": "queryable"
+    },
+    {
+      "command": "IFA",
+      "response": "IFAHDMI 2,PCM,   48kHz, 2.0ch,Dolby PLII Music,,",
+      "result": "queryable"
+    },
+    {
+      "command": "IFV",
+      "response": "IFVV(VCR/DVR),UNKNOWN,,,Analog, 720x480i  60Hz,,,Custom,",
+      "result": "queryable"
+    },
+    {
+      "command": "FLD",
+      "error": "Timeout waiting for response.",
+      "response": null,
+      "result": "timeout"
+    }
+  ]
+}

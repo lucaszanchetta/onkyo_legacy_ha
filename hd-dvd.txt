@@ -1,0 +1,84 @@
+Here are RS232C Serial Commands for Toshiba's new HD DVD Player
+
+serial communications protocol consists of start codes (4bytes), function code (2bytes), and reversal function code (2 bytes) for Toshiba HD DVD Player
+
+Start code 0x45 and 0xB5
+
+Example to send a pause code "00"
+0x45,0xB5,0x00,0xFF
+
+Example to send a Play code "15"
+0x45,0xB5,0x15,0xEA
+
+RS232C protocol:
+
+3 wire 9600bps /8 data bits /1 stop bit /no parity /no flow control
+9 pin male D connector DB9
+
+pin 2 is receive
+pin 3 is transmit
+pin 5 is signal ground
+
+
+
+start code: "45 + "B5"
+
+Table of functions
+
+00 Pause/step
+01 1
+02 2
+03 3
+04 4
+05 5
+06 6
+07 7
+08 8
+09 9
+0A 0
+0D Slow
+12 Power ON/Standby
+13 Forward
+14 Stop
+15 Play
+16 Display (Navi)
+19 Review
+1B Cancel
+20 Setup
+21 Enter
+22 Return
+23 Skip (back)
+24 Skip (forward)
+25 +10
+26 T. Search
+27 Audio
+28 Subtitle
+29 Angle
+2B Repeat (VCR=Play Mode)
+31 Door
+32 Tab
+33 Cursor
+34 A
+35 B
+36 C
+37 D
+38 Return from Menu (resume)
+41 Dimmer
+4D Right
+4E I/P Selector (resolution)
+51 Left
+80 UP
+81 Down
+82 Upper Right
+83 Lower Right
+84 Menu
+85 Lower Left
+86 Upper LEFT (corrected code)
+92 Power ON
+93 Power OFF
+9F HDMI
+DE Title (Top Menu)
+EF Clear
+F5 Open/Close
+
+Last edited by markrubin on May 29, 2007 16:03.

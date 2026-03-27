@@ -2,6 +2,7 @@
   "domain": "onkyo_legacy",
   "name": "Onkyo Legacy",
   "version": "0.1.0",
+  "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/media_player/",
   "integration_type": "device",
   "requirements": ["onkyo-eiscp==1.2.7"],

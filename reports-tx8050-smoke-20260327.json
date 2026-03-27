@@ -1,0 +1,178 @@
+{
+  "host": "192.168.1.14",
+  "model": "TX-8050",
+  "port": 60128,
+  "queries": [
+    {
+      "command": "PWR",
+      "response": "PWR00",
+      "result": "queryable"
+    },
+    {
+      "command": "MVL",
+      "response": "MVL21",
+      "result": "queryable"
+    },
+    {
+      "command": "AMT",
+      "response": "AMT00",
+      "result": "queryable"
+    },
+    {
+      "command": "SLI",
+      "response": "SLI2B",
+      "result": "queryable"
+    },
+    {
+      "command": "ZPW",
+      "response": "ZPW01",
+      "result": "queryable"
+    },
+    {
+      "command": "ZVL",
+      "error": "timed out",
+      "response": null,
+      "result": "TimeoutError"
+    },
+    {
+      "command": "ZMT",
+      "response": "ZMT00",
+      "result": "queryable"
+    },
+    {
+      "command": "SLZ",
+      "response": "SLZ80",
+      "result": "queryable"
+    },
+    {
+      "command": "LMD",
+      "response": "LMD00",
+      "result": "queryable"
+    },
+    {
+      "command": "DIM",
+      "response": "DIM00",
+      "result": "queryable"
+    },
+    {
+      "command": "SLP",
+      "response": "SLP00",
+      "result": "queryable"
+    },
+    {
+      "command": "TUN",
+      "response": "TUN10710",
+      "result": "queryable"
+    }
+  ],
+  "timeout": 2,
+  "write_value_options": {
+    "AMT": [
+      "00",
+      "01",
+      "TG",
+      "QSTN"
+    ],
+    "DIM": [
+      "00",
+      "01",
+      "02",
+      "03",
+      "08",
+      "DIM",
+      "QSTN"
+    ],
+    "MVL": [
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        100
+      ],
+      [
+        0,
+        80
+      ],
+      [
+        0,
+        50
+      ],
+      "UP",
+      "DOWN",
+      "UP1",
+      "DOWN1",
+      "QSTN"
+    ],
+    "SLP": [
+      "\u201c01\u201d-\u201c5A\u201d",
+      "\u201cOFF\u201d",
+      "\u201cUP\u201d",
+      "\u201cQSTN\u201d"
+    ],
+    "ZMT": [
+      "00",
+      "01",
+      "TG",
+      "QSTN"
+    ],
+    "ZVL": [
+      [
+        0,
+        200
+      ],
+      [
+        0,
+        100
+      ],
+      [
+        0,
+        80
+      ],
+      "UP",
+      "DOWN",
+      "UP1",
+      "DOWN1",
+      "QSTN"
+    ]
+  },
+  "writes": [
+    {
+      "after": "AMT00",
+      "before": "AMT00",
+      "command": "AMT",
+      "error": null
+    },
+    {
+      "after": "ZMT00",
+      "before": "ZMT00",
+      "command": "ZMT",
+      "error": null
+    },
+    {
+      "after": "MVL21",
+      "before": "MVL21",
+      "command": "MVL",
+      "error": null
+    },
+    {
+      "after": "ZVLN/A",
+      "before": "ZVLN/A",
+      "command": "ZVL",
+      "error": null
+    },
+    {
+      "after": "DIM00",
+      "before": "DIM00",
+      "command": "DIM",
+      "error": null
+    },
+    {
+      "after": "SLP00",
+      "before": "SLP00",
+      "command": "SLP",
+      "error": null
+    }
+  ]
+}

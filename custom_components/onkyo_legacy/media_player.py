@@ -7,54 +7,47 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData
+from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
 
 
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
+    entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the media player from discovery info."""
-    if not discovery_info:
-        return
-
-    runtime: OnkyoRuntimeData = hass.data[DOMAIN][discovery_info["runtime_id"]]
+    """Set up the media player from a config entry."""
+    runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([OnkyoLegacyMediaPlayer(runtime)])
 
 
 class OnkyoLegacyMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
-    """Represent the main-zone legacy Onkyo device."""
+    """Represent one legacy Onkyo zone."""
 
     _attr_has_entity_name = True
-    _attr_name = None
-    _attr_supported_features = (
-        MediaPlayerEntityFeature.TURN_ON
-        | MediaPlayerEntityFeature.TURN_OFF
-        | MediaPlayerEntityFeature.VOLUME_SET
-        | MediaPlayerEntityFeature.VOLUME_STEP
-        | MediaPlayerEntityFeature.VOLUME_MUTE
-        | MediaPlayerEntityFeature.SELECT_SOURCE
-    )
+    _attr_icon = "mdi:audio-video"
 
-    def __init__(self, runtime: OnkyoRuntimeData) -> None:
+    def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
-        self._attr_unique_id = f"{runtime.host}-main"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, runtime.host)},
-            "name": runtime.title,
-            "manufacturer": "Onkyo",
-            "model": "PR-SC5507",
-            "configuration_url": f"http://{runtime.host}",
-        }
+        self._attr_name = None if runtime.zone_key == "main" else runtime.zone_label
+        self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}"
+        self._attr_device_info = runtime.device_info
+        supported_features = (
+            MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.VOLUME_STEP
+            | MediaPlayerEntityFeature.VOLUME_MUTE
+        )
+        if runtime.sources:
+            supported_features |= MediaPlayerEntityFeature.SELECT_SOURCE
+        self._attr_supported_features = supported_features
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -72,7 +65,10 @@ class OnkyoLegacyMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
 
     @property
     def volume_level(self) -> float | None:
-        return min(self.coordinator.data.volume / self._runtime.max_volume, 1.0)
+        volume = self.coordinator.data.volume
+        if volume is None:
+            return None
+        return min(volume / self._runtime.max_volume, 1.0)
 
     @property
     def is_volume_muted(self) -> bool | None:
