@@ -262,6 +262,42 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.sleep_minutes, 30)
         self.assertEqual(state.tuner_frequency, 10710)
 
+    async def test_update_data_keeps_previous_optional_values_when_queries_fail(self) -> None:
+        client = FakeClient(
+            {
+                "PWR": "PWR01",
+                "MVL": "MVL2A",
+                "AMT": "AMT00",
+                "SLI": "SLI02",
+                "SLA": TimeoutError("temporary timeout"),
+                "RAS": TimeoutError("temporary timeout"),
+                "SLP": TimeoutError("temporary timeout"),
+                "IFA": TimeoutError("temporary timeout"),
+            }
+        )
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="192.168.1.23",
+            name="Onkyo PR-SC5507",
+            update_interval=10,
+        )
+        for command in ("SLA", "RAS", "SLP", "IFA"):
+            coordinator.set_command_capability(command, True)
+        coordinator.data = self.module.OnkyoState(
+            audio_selector="auto",
+            cinema_filter=True,
+            sleep_minutes=45,
+            audio_information={"input_terminal": "HDMI 1"},
+        )
+
+        state = await coordinator._async_update_data()
+
+        self.assertEqual(state.audio_selector, "auto")
+        self.assertTrue(state.cinema_filter)
+        self.assertEqual(state.sleep_minutes, 45)
+        self.assertEqual(state.audio_information, {"input_terminal": "HDMI 1"})
+
     async def test_live_truth_send_paths_cover_retained_controls(self) -> None:
         client = FakeClient({"PWR": "PWR01", "MVL": "MVL23", "AMT": "AMT00", "SLI": "SLI00"})
         coordinator = self.module.OnkyoLegacyCoordinator(
