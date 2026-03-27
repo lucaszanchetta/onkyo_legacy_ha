@@ -89,3 +89,8 @@ PROFILE_QUERYABLE_COMMANDS: Final = {
         "TUN",
     ),
 }
+
+PROFILE_SUPPORTED_ZONES: Final = {
+    MODEL: ("main", "zone2", "zone3"),
+    MODEL_TX8050: ("main",),
+}

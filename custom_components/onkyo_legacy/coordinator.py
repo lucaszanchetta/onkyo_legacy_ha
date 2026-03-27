@@ -22,6 +22,7 @@ from .const import (
     MODEL_TX8050,
     PROFILE_DEFAULT_SOURCES,
     PROFILE_QUERYABLE_COMMANDS,
+    PROFILE_SUPPORTED_ZONES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -597,6 +598,7 @@ def build_runtime_data(
         entity_ids=entity_ids,
     )
 
+    candidate_zone_keys = PROFILE_SUPPORTED_ZONES[normalized_model]
     candidate_zones = tuple(
         _build_zone_runtime(
             hass=hass,
@@ -611,7 +613,8 @@ def build_runtime_data(
             client=client,
             zone=ZONE_DEFINITIONS[zone_key],
         )
-        for zone_key in ("zone2", "zone3")
+        for zone_key in candidate_zone_keys
+        if zone_key != "main"
     )
     runtime.zones = (runtime,)
     runtime.candidate_zones = candidate_zones

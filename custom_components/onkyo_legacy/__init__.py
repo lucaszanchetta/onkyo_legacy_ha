@@ -139,29 +139,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return False
 
     for command in runtime.queryable_commands:
-        runtime.coordinator.set_command_capability(
-            command,
-            await runtime.coordinator.async_probe_command(command),
-        )
+        runtime.coordinator.set_command_capability(command, True)
 
-    supported_zones = [runtime]
-    for zone_runtime in runtime.candidate_zones:
-        try:
-            await zone_runtime.coordinator.async_refresh()
-        except Exception as err:
-            _LOGGER.info(
-                "Skipping %s for %s:%s because core zone queries failed: %s",
-                zone_runtime.zone_label,
-                entry.data[CONF_HOST],
-                entry.data[CONF_PORT],
-                err,
-            )
-            continue
-
-        if zone_runtime.coordinator.last_update_success:
-            supported_zones.append(zone_runtime)
-
-    runtime.zones = tuple(supported_zones)
+    runtime.zones = (runtime, *runtime.candidate_zones)
 
     hass.data[DOMAIN][entry.entry_id] = runtime
     await _async_migrate_main_entity_unique_ids(hass, runtime.host)
