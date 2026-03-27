@@ -309,11 +309,15 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.audio_selector = await self._async_query_optional_mode(
                 "SLA", AUDIO_SELECTOR_RAW_TO_NAME
             )
+            if state.audio_selector is None:
+                state.audio_selector = previous.audio_selector
         else:
             state.audio_selector = previous.audio_selector
 
         if self.supports("LMD"):
             state.listening_mode = await self._async_query_optional_mode("LMD")
+            if state.listening_mode is None:
+                state.listening_mode = previous.listening_mode
         else:
             state.listening_mode = previous.listening_mode
 
@@ -321,6 +325,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.late_night_mode = await self._async_query_optional_mode(
                 "LTN", LATE_NIGHT_RAW_TO_NAME
             )
+            if state.late_night_mode is None:
+                state.late_night_mode = previous.late_night_mode
         else:
             state.late_night_mode = previous.late_night_mode
 
@@ -328,6 +334,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.cinema_filter = await self._async_query_optional_switch(
                 "RAS", CINEMA_FILTER_RAW_TO_NAME
             )
+            if state.cinema_filter is None:
+                state.cinema_filter = previous.cinema_filter
         else:
             state.cinema_filter = previous.cinema_filter
 
@@ -335,6 +343,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.audyssey_dynamic_eq = await self._async_query_optional_switch(
                 "ADQ", AUDYSSEY_EQ_RAW_TO_NAME
             )
+            if state.audyssey_dynamic_eq is None:
+                state.audyssey_dynamic_eq = previous.audyssey_dynamic_eq
         else:
             state.audyssey_dynamic_eq = previous.audyssey_dynamic_eq
 
@@ -342,6 +352,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.audyssey_dynamic_volume = await self._async_query_optional_mode(
                 "ADV", AUDYSSEY_VOLUME_RAW_TO_NAME
             )
+            if state.audyssey_dynamic_volume is None:
+                state.audyssey_dynamic_volume = previous.audyssey_dynamic_volume
         else:
             state.audyssey_dynamic_volume = previous.audyssey_dynamic_volume
 
@@ -349,46 +361,64 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.music_optimizer = await self._async_query_optional_switch(
                 "MOT", MUSIC_OPTIMIZER_RAW_TO_NAME
             )
+            if state.music_optimizer is None:
+                state.music_optimizer = previous.music_optimizer
         else:
             state.music_optimizer = previous.music_optimizer
 
         if self.supports("TGA"):
             state.trigger_a = await self._async_query_optional_switch("TGA", TRIGGER_A_RAW_TO_NAME)
+            if state.trigger_a is None:
+                state.trigger_a = previous.trigger_a
         else:
             state.trigger_a = previous.trigger_a
 
         if self.supports("TGB"):
             state.trigger_b = await self._async_query_optional_switch("TGB", TRIGGER_B_RAW_TO_NAME)
+            if state.trigger_b is None:
+                state.trigger_b = previous.trigger_b
         else:
             state.trigger_b = previous.trigger_b
 
         if self.supports("TGC"):
             state.trigger_c = await self._async_query_optional_switch("TGC", TRIGGER_C_RAW_TO_NAME)
+            if state.trigger_c is None:
+                state.trigger_c = previous.trigger_c
         else:
             state.trigger_c = previous.trigger_c
 
         if self.supports("DIM"):
             state.dimmer_level = await self._async_query_optional_mode("DIM", DIMMER_RAW_TO_NAME)
+            if state.dimmer_level is None:
+                state.dimmer_level = previous.dimmer_level
         else:
             state.dimmer_level = previous.dimmer_level
 
         if self.supports("SLP"):
             state.sleep_minutes = await self._async_query_optional_sleep("SLP")
+            if state.sleep_minutes is None:
+                state.sleep_minutes = previous.sleep_minutes
         else:
             state.sleep_minutes = previous.sleep_minutes
 
         if self.supports("CTL"):
             state.center_level = await self._async_query_optional_level("CTL")
+            if state.center_level is None:
+                state.center_level = previous.center_level
         else:
             state.center_level = previous.center_level
 
         if self.supports("SWL"):
             state.subwoofer_level = await self._async_query_optional_level("SWL")
+            if state.subwoofer_level is None:
+                state.subwoofer_level = previous.subwoofer_level
         else:
             state.subwoofer_level = previous.subwoofer_level
 
         if self.supports("TUN"):
             state.tuner_frequency = await self._async_query_optional_tuner("TUN")
+            if state.tuner_frequency is None:
+                state.tuner_frequency = previous.tuner_frequency
         else:
             state.tuner_frequency = previous.tuner_frequency
 
@@ -396,6 +426,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.audio_information = await self._async_query_optional_information(
                 "IFA", _parse_audio_information
             )
+            if not state.audio_information:
+                state.audio_information = dict(previous.audio_information)
         else:
             state.audio_information = dict(previous.audio_information)
 
@@ -403,6 +435,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             state.video_information = await self._async_query_optional_information(
                 "IFV", _parse_video_information
             )
+            if not state.video_information:
+                state.video_information = dict(previous.video_information)
         else:
             state.video_information = dict(previous.video_information)
 
@@ -447,12 +481,12 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             return None
         return _parse_switch(raw, value_map)
 
-    async def _async_query_optional_sleep(self, command: str) -> int:
+    async def _async_query_optional_sleep(self, command: str) -> int | None:
         try:
             raw = await self.hass.async_add_executor_job(self.client.query, command)
         except Exception as err:
             _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return 0
+            return None
         return _parse_sleep(raw)
 
     async def _async_query_optional_level(self, command: str) -> int | None:
