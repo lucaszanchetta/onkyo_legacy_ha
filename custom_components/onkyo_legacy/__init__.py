@@ -30,7 +30,7 @@ from .const import (
     SERVICE_REFRESH,
     SERVICE_SET_LISTENING_MODE,
 )
-from .coordinator import OnkyoRuntimeData, build_runtime_data
+from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, build_runtime_data
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +61,23 @@ STALE_ENTITY_UNIQUE_IDS: tuple[tuple[str, str], ...] = (
     ("switch", "zone2-mute"),
     ("switch", "zone3-mute"),
 )
+
+ZONE_ENTITY_UNIQUE_ID_SUFFIXES: dict[str, tuple[tuple[str, str], ...]] = {
+    "zone2": (
+        ("media_player", "zone2"),
+        ("number", "zone2-volume-level"),
+        ("select", "zone2-source"),
+        ("switch", "zone2-power"),
+        ("switch", "zone2-mute"),
+    ),
+    "zone3": (
+        ("media_player", "zone3"),
+        ("number", "zone3-volume-level"),
+        ("select", "zone3-source"),
+        ("switch", "zone3-power"),
+        ("switch", "zone3-mute"),
+    ),
+}
 
 DEVICE_SCHEMA = vol.Schema(
     {
@@ -106,6 +123,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Onkyo from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
     model = str(entry.data.get(CONF_MODEL, DEFAULT_MODEL)).strip().upper()
     runtime = build_runtime_data(
         hass,
@@ -122,12 +140,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for command in runtime.queryable_commands:
         runtime.coordinator.set_command_capability(command, True)
 
+    runtime.zones = await _async_detect_supported_zones(runtime)
     hass.async_create_task(_async_initial_refresh(runtime))
-
-    runtime.zones = (runtime, *runtime.candidate_zones)
 
     hass.data[DOMAIN][entry.entry_id] = runtime
     await _async_migrate_main_entity_unique_ids(hass, runtime.host)
+    await _async_remove_unsupported_zone_registry_entries(hass, runtime)
     await _async_remove_stale_entity_registry_entries(hass, runtime.host)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     hass.bus.async_listen_once("homeassistant_stop", lambda _event: _disconnect_all(hass))
@@ -145,6 +163,28 @@ async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
             runtime.port,
             err,
         )
+
+
+async def _async_detect_supported_zones(
+    runtime: OnkyoRuntimeData,
+) -> tuple[OnkyoRuntimeData | OnkyoZoneRuntimeData, ...]:
+    zones: list[OnkyoRuntimeData | OnkyoZoneRuntimeData] = [runtime]
+    for zone_runtime in runtime.candidate_zones:
+        try:
+            await zone_runtime.coordinator.hass.async_add_executor_job(
+                zone_runtime.coordinator._query_core_state
+            )
+        except Exception as err:
+            _LOGGER.info(
+                "Skipping %s on %s:%s because core queries failed: %s",
+                zone_runtime.zone_label,
+                zone_runtime.host,
+                zone_runtime.port,
+                err,
+            )
+            continue
+        zones.append(zone_runtime)
+    return tuple(zones)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -244,6 +284,24 @@ async def _async_remove_stale_entity_registry_entries(hass: HomeAssistant, host:
         entity_id = registry.async_get_entity_id(platform, DOMAIN, unique_id)
         if entity_id:
             registry.async_remove(entity_id)
+
+
+async def _async_remove_unsupported_zone_registry_entries(
+    hass: HomeAssistant,
+    runtime: OnkyoRuntimeData,
+) -> None:
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    active_zone_keys = {zone_runtime.zone_key for zone_runtime in runtime.zones}
+    for zone_key, entries in ZONE_ENTITY_UNIQUE_ID_SUFFIXES.items():
+        if zone_key in active_zone_keys:
+            continue
+        for platform, suffix in entries:
+            unique_id = f"{runtime.host}-{suffix}"
+            entity_id = registry.async_get_entity_id(platform, DOMAIN, unique_id)
+            if entity_id:
+                registry.async_remove(entity_id)
 
 
 def _async_update_entity_id_if_available(registry: object, current_entity_id: str, desired_entity_id: str) -> None:

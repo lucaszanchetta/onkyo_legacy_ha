@@ -156,8 +156,53 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             registry.async_get_entity_id("switch", "onkyo_legacy", "192.168.1.23-zone3-mute")
         )
 
+    async def test_unsupported_zone_registry_entries_are_removed(self) -> None:
+        entity_registry = sys.modules["homeassistant.helpers.entity_registry"]
+        registry = entity_registry.async_get(self.hass)
+        registry.add(
+            "media_player",
+            "onkyo_legacy",
+            "192.168.1.23-zone2",
+            "media_player.onkyo_pr_sc5507_zone_2",
+        )
+        registry.add(
+            "number",
+            "onkyo_legacy",
+            "192.168.1.23-zone2-volume-level",
+            "number.onkyo_pr_sc5507_zone_2_volume_level",
+        )
+        registry.add(
+            "select",
+            "onkyo_legacy",
+            "192.168.1.23-zone2-source",
+            "select.onkyo_pr_sc5507_zone_2_source",
+        )
+        runtime = type("Runtime", (), {})()
+        runtime.host = "192.168.1.23"
+        runtime.zones = (type("MainRuntime", (), {"zone_key": "main"})(),)
+
+        await self.init_module._async_remove_unsupported_zone_registry_entries(
+            self.hass, runtime
+        )
+
+        self.assertIsNone(
+            registry.async_get_entity_id("media_player", "onkyo_legacy", "192.168.1.23-zone2")
+        )
+        self.assertIsNone(
+            registry.async_get_entity_id(
+                "number", "onkyo_legacy", "192.168.1.23-zone2-volume-level"
+            )
+        )
+        self.assertIsNone(
+            registry.async_get_entity_id("select", "onkyo_legacy", "192.168.1.23-zone2-source")
+        )
+
 
     async def test_setup_entry_does_not_fail_when_initial_refresh_times_out(self) -> None:
+        async def fake_detect(runtime):
+            return (runtime,)
+
+        self.init_module._async_detect_supported_zones = fake_detect
         entry = self.init_module.ConfigEntry(
             entry_id="entry-1",
             data={
@@ -181,6 +226,28 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         refresh_task = self.hass.created_tasks[0]
         await refresh_task
         self.assertFalse(runtime.coordinator.last_update_success)
+
+    async def test_detect_supported_zones_returns_main_only_without_candidates(self) -> None:
+        class ProbeCoordinator:
+            def __init__(self, should_fail: bool) -> None:
+                self.should_fail = should_fail
+                self.hass = self_outer.hass
+
+            def _query_core_state(self) -> tuple[str, str, str, str]:
+                if self.should_fail:
+                    raise TimeoutError("no response")
+                return ("PWR01", "MVL00", "AMT00", "SLI00")
+
+        self_outer = self
+        runtime = type("Runtime", (), {})()
+        runtime.zone_label = "Main"
+        runtime.host = "192.168.1.23"
+        runtime.port = 60128
+        runtime.candidate_zones = ()
+
+        zones = await self.init_module._async_detect_supported_zones(runtime)
+
+        self.assertEqual([zone.zone_label for zone in zones], ["Main"])
 
     async def test_services_registration_and_routing(self) -> None:
         runtime = type("Runtime", (), {})()

@@ -79,23 +79,7 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             "IFV",
         ):
             runtime.coordinator.set_command_capability(command, True)
-        zone2 = runtime.candidate_zones[0]
-        zone2.coordinator.data = self.coordinator_module.OnkyoState(
-            power=False,
-            volume=22,
-            muted=True,
-            source="dvd",
-        )
-        zone2.coordinator.last_update_success = True
-        zone3 = runtime.candidate_zones[1]
-        zone3.coordinator.data = self.coordinator_module.OnkyoState(
-            power=True,
-            volume=18,
-            muted=False,
-            source="video1",
-        )
-        zone3.coordinator.last_update_success = True
-        runtime.zones = (runtime, zone2, zone3)
+        runtime.zones = (runtime,)
         return runtime
 
     def _tx8050_runtime(self):
@@ -136,6 +120,28 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity.source_list, ["VIDEO1", "DVD -- BD/DVD"])
         self.assertAlmostEqual(entity.volume_level, 0.5)
 
+    async def test_media_player_setup_creates_main_entity(self) -> None:
+        runtime = self._runtime()
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+        entities: list[object] = []
+        counter = {"value": 0}
+        entry = type("Entry", (), {"entry_id": "entry-1", "data": {}})()
+
+        def capture(new_entities):
+            for entity in new_entities:
+                entity.entity_id = f"test.entity_{counter['value']}"
+                counter["value"] += 1
+                entities.append(entity)
+
+        await self.media_player_module.async_setup_entry(self.hass, entry, capture)
+
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(
+            [entity._attr_unique_id for entity in entities],
+            ["192.168.1.23-main"],
+        )
+        self.assertEqual([entity._attr_name for entity in entities], [None])
+
     async def test_select_setup_creates_theater_select_entities(self) -> None:
         runtime = self._runtime()
         self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
@@ -160,8 +166,6 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             names,
             {
                 "Source",
-                "Zone 2 Source",
-                "Zone 3 Source",
                 "Listening Mode",
                 "Dimmer Level",
                 "Audio Selector",
@@ -250,8 +254,6 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             names,
             {
                 "Volume Level",
-                "Zone 2 Volume Level",
-                "Zone 3 Volume Level",
                 "Sleep Timer",
                 "Center Temporary Level",
                 "Subwoofer Temporary Level",

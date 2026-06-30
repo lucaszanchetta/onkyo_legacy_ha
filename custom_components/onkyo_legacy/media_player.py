@@ -23,7 +23,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up the media player from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([OnkyoLegacyMediaPlayer(runtime)])
+    async_add_entities(
+        [OnkyoLegacyMediaPlayer(zone_runtime) for zone_runtime in runtime.zones]
+    )
 
 
 class OnkyoLegacyMediaPlayer(CoordinatorEntity, MediaPlayerEntity):

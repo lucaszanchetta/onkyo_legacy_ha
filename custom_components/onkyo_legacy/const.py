@@ -91,6 +91,6 @@ PROFILE_QUERYABLE_COMMANDS: Final = {
 }
 
 PROFILE_SUPPORTED_ZONES: Final = {
-    MODEL: ("main", "zone2", "zone3"),
+    MODEL: ("main",),
     MODEL_TX8050: ("main",),
 }
