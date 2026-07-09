@@ -99,6 +99,14 @@ def install_stubs() -> None:
     const.CONF_ENTITY_ID = "entity_id"
     sys.modules["homeassistant.const"] = const
 
+    exceptions = types.ModuleType("homeassistant.exceptions")
+
+    class HomeAssistantError(Exception):
+        pass
+
+    exceptions.HomeAssistantError = HomeAssistantError
+    sys.modules["homeassistant.exceptions"] = exceptions
+
     core = types.ModuleType("homeassistant.core")
 
     @dataclass

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 import unittest
+from unittest.mock import MagicMock
 
 from tests.helpers import FakeHass, fresh_import
 
@@ -469,3 +471,119 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(self.module.UpdateFailed):
             await coordinator._async_update_data()
+
+    # ------------------------------------------------------------------
+    # Circuit breaker tests for OnkyoLegacyClient
+    # ------------------------------------------------------------------
+
+    async def test_circuit_breaker_resets_on_success(self) -> None:
+        """After 4 failures and 1 success, _consecutive_failures should be 0."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+
+        mock_device = MagicMock()
+        call_count = 0
+
+        def raw_side_effect(msg: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 4:
+                raise OSError("device busy")
+            return "PWR01"
+
+        mock_device.raw.side_effect = raw_side_effect
+        mock_device.disconnect.return_value = None
+        client._device = mock_device
+        client._connect = lambda: mock_device
+
+        for _ in range(4):
+            with self.assertRaises(OSError):
+                client.query("PWR")
+
+        self.assertEqual(client._consecutive_failures, 4)
+
+        result = client.query("PWR")
+        self.assertEqual(result, "PWR01")
+        self.assertEqual(client._consecutive_failures, 0)
+
+    async def test_circuit_breaker_opens_after_consecutive_failures(self) -> None:
+        """After 5 consecutive failures, _circuit_open_until should be set."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+
+        mock_device = MagicMock()
+        mock_device.raw.side_effect = OSError("device busy")
+        mock_device.disconnect.return_value = None
+        client._device = mock_device
+        client._connect = lambda: mock_device
+
+        before = time.monotonic()
+        for _ in range(5):
+            with self.assertRaises(OSError):
+                client.query("PWR")
+
+        self.assertEqual(client._consecutive_failures, 5)
+        self.assertGreater(client._circuit_open_until, before)
+
+    async def test_circuit_breaker_blocks_when_open(self) -> None:
+        """When circuit is open, calls should raise ConnectionError immediately."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+        client._circuit_open_until = time.monotonic() + 60
+
+        with self.assertRaises(ConnectionError):
+            client.send("MVL", "UP")
+
+        with self.assertRaises(ConnectionError):
+            client.query("PWR")
+
+    async def test_circuit_breaker_recovers_after_cooldown(self) -> None:
+        """After the 30s cooldown, calls should succeed again."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+        client._circuit_open_until = time.monotonic() - 1  # just expired
+        client._consecutive_failures = 5
+
+        mock_device = MagicMock()
+        mock_device.raw.return_value = "PWR01"
+        mock_device.send.return_value = None
+        mock_device.disconnect.return_value = None
+        client._device = mock_device
+        client._connect = lambda: mock_device
+
+        result = client.query("PWR")
+        self.assertEqual(result, "PWR01")
+        self.assertEqual(client._consecutive_failures, 0)
+
+        client.send("MVL", "UP")
+
+    async def test_circuit_breaker_reopens_after_recovery_failure(self) -> None:
+        """After cooldown, if the next call fails, circuit should re-open."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+        client._consecutive_failures = 5
+        client._circuit_open_until = time.monotonic() - 1  # just expired
+
+        mock_device = MagicMock()
+        mock_device.raw.side_effect = OSError("device busy")
+        mock_device.disconnect.return_value = None
+        client._device = mock_device
+        client._connect = lambda: mock_device
+
+        before = time.monotonic()
+        with self.assertRaises(OSError):
+            client.query("PWR")
+
+        self.assertEqual(client._consecutive_failures, 6)
+        self.assertGreater(client._circuit_open_until, before)
+
+    async def test_send_raises_home_assistant_error_when_circuit_open(self) -> None:
+        """Verify that send() surfaces HomeAssistantError when circuit is open."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
+        client._circuit_open_until = time.monotonic() + 60
+
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator._async_send("MVL", "UP")

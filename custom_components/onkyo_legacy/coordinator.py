@@ -12,6 +12,7 @@ from typing import Any
 from eiscp import eISCP
 from eiscp import commands as eiscp_commands
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -323,7 +324,9 @@ class OnkyoLegacyClient:
         last_error: Exception | None = None
         for attempt in range(self._retries):
             try:
-                return method(*args)
+                result = method(*args)
+                self._consecutive_failures = 0
+                return result
             except self._RETRYABLE_ERRORS as err:
                 last_error = err
                 _LOGGER.debug(
@@ -595,7 +598,12 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         await self._async_send(command, "01" if enabled else "00")
 
     async def _async_send(self, command: str, value: str) -> None:
-        await self.hass.async_add_executor_job(self.client.send, command, value)
+        try:
+            await self.hass.async_add_executor_job(self.client.send, command, value)
+        except ConnectionError as err:
+            raise HomeAssistantError(
+                "Onkyo receiver is temporarily unavailable (circuit breaker open)"
+            ) from err
         await self.async_request_refresh()
 
 
