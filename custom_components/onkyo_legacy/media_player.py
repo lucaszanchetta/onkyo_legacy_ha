@@ -15,6 +15,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
 
+__all__ = ["async_setup_entry"]
+
 
 async def async_setup_entry(
     hass: HomeAssistant,

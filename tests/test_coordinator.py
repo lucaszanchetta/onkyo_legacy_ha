@@ -18,6 +18,16 @@ class FakeClient:
             raise ValueError(f"missing response for {command}")
         return response
 
+    def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
+        results: dict[str, str] = {}
+        for command in commands:
+            response = self.responses.get(command)
+            if isinstance(response, Exception):
+                continue
+            if response is not None:
+                results[command] = response
+        return results
+
     def send(self, command: str, value: str) -> None:
         self.sent.append((command, value))
 
@@ -130,6 +140,30 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 sources={"Bad": "not-a-source"},
                 max_volume=80,
             )
+
+    async def test_build_runtime_data_warns_skips_unknown_source_in_permissive_mode(self) -> None:
+        runtime = self.module.build_runtime_data(
+            self.hass,
+            host="192.168.1.23",
+            port=60128,
+            name="Onkyo PR-SC5507",
+            model="PR-SC5507",
+            scan_interval=10,
+            sources={"Bad": "not-a-source", "Blu-ray": "dvd"},
+            max_volume=80,
+            strict_sources=False,
+        )
+        self.assertIn("DVD -- BD/DVD", runtime.sources)
+        self.assertNotIn("Bad", runtime.sources)
+        self.assertEqual(len(runtime.sources), 1)
+
+    async def test_normalize_sources_returns_skipped_set(self) -> None:
+        normalized, skipped = self.module._normalize_sources(
+            {"Bad": "not-a-source", "TV": "tv"},
+            strict=False,
+        )
+        self.assertEqual(skipped, {"not-a-source"})
+        self.assertIn("TV", normalized)
 
     async def test_build_runtime_data_filters_zone_only_supported_sources(self) -> None:
         runtime = self.module.build_runtime_data(
@@ -359,3 +393,79 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("ZMT", "00"), client.sent)
         self.assertIn(("ZVL", "UP1"), client.sent)
         self.assertIn(("SLZ", "12"), client.sent)
+
+    async def test_query_batch_returns_all_results(self) -> None:
+        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
+        client._host = "test"
+        client._port = 60128
+        client._device = None
+        client._retries = 2
+        client._consecutive_failures = 0
+        client._circuit_open_until = 0.0
+        from threading import Lock
+        client._lock = Lock()
+
+        class FakeDevice:
+            def __init__(self, responses: dict[str, str]) -> None:
+                self._responses = responses
+            def raw(self, msg: str) -> str:
+                cmd = msg[:3]
+                return self._responses[cmd]
+            def disconnect(self) -> None:
+                pass
+
+        device = FakeDevice({"PWR": "PWR01", "MVL": "MVL2A", "SLI": "SLI02"})
+        client._device = device
+
+        results = client.query_batch(("PWR", "MVL", "SLI"))
+
+        self.assertEqual(results, {"PWR": "PWR01", "MVL": "MVL2A", "SLI": "SLI02"})
+
+    async def test_query_batch_aborts_on_first_failure(self) -> None:
+        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
+        client._host = "test"
+        client._port = 60128
+        client._device = None
+        client._retries = 1
+        client._consecutive_failures = 0
+        client._circuit_open_until = 0.0
+        from threading import Lock
+        client._lock = Lock()
+
+        class FailingDevice:
+            def raw(self, msg: str) -> str:
+                raise TimeoutError("no response")
+            def disconnect(self) -> None:
+                pass
+
+        client._device = FailingDevice()
+
+        results = client.query_batch(("PWR", "MVL", "SLI"))
+
+        self.assertEqual(results, {})
+
+    async def test_update_data_raises_when_core_command_missing_from_batch(self) -> None:
+        client = FakeClient({"PWR": "PWR01"})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="192.168.1.23",
+            name="Onkyo PR-SC5507",
+            update_interval=10,
+        )
+
+        with self.assertRaises(self.module.UpdateFailed):
+            await coordinator._async_update_data()
+
+    async def test_update_data_raises_when_batch_completely_empty(self) -> None:
+        client = FakeClient({})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="192.168.1.23",
+            name="Onkyo PR-SC5507",
+            update_interval=10,
+        )
+
+        with self.assertRaises(self.module.UpdateFailed):
+            await coordinator._async_update_data()

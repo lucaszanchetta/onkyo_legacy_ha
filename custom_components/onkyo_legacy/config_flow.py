@@ -6,18 +6,24 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 
 from .const import (
-    CONF_MODEL,
     CONF_MAX_VOLUME,
+    CONF_MODEL,
+    CONF_RETRIES,
     CONF_SCAN_INTERVAL,
     CONF_SOURCES,
-    DEFAULT_MODEL,
+    CONF_STRICT_SOURCES,
     DEFAULT_MAX_VOLUME,
+    DEFAULT_MODEL,
     DEFAULT_PORT,
+    DEFAULT_RETRIES,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_STRICT_SOURCES,
     PROFILE_DEFAULT_NAMES,
     PROFILE_DEFAULT_SOURCES,
     DOMAIN,
 )
+
+__all__ = ["OnkyoLegacyConfigFlow"]
 
 
 class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -40,5 +46,7 @@ class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_SCAN_INTERVAL: user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
             CONF_MAX_VOLUME: user_input.get(CONF_MAX_VOLUME, DEFAULT_MAX_VOLUME),
             CONF_SOURCES: user_input.get(CONF_SOURCES) or PROFILE_DEFAULT_SOURCES[model],
+            CONF_RETRIES: user_input.get(CONF_RETRIES, DEFAULT_RETRIES),
+            CONF_STRICT_SOURCES: user_input.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
         }
         return self.async_create_entry(title=data[CONF_NAME], data=data)

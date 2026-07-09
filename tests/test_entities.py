@@ -339,3 +339,55 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(icons["Audio Input Terminal"], "mdi:input-hdmi")
         self.assertEqual(icons["Audio Listening Mode"], "mdi:surround-sound")
         self.assertEqual(icons["Video Output Resolution"], "mdi:monitor")
+
+    async def test_sensor_native_value_returns_populated_data(self) -> None:
+        runtime = self._runtime()
+        desc = self.sensor_module.SENSOR_DESCRIPTIONS[0]
+        entity = self.sensor_module.OnkyoLegacyDiagnosticSensor(runtime, desc)
+
+        self.assertEqual(entity.native_value, "HDMI 2")
+
+    async def test_sensor_native_value_returns_none_for_empty_data(self) -> None:
+        runtime = self._runtime()
+        runtime.coordinator.data = self.coordinator_module.OnkyoState(
+            power=True,
+            volume=40,
+            muted=False,
+            source="video1",
+            audio_information={},
+            video_information={},
+        )
+        desc = self.sensor_module.SENSOR_DESCRIPTIONS[0]
+        entity = self.sensor_module.OnkyoLegacyDiagnosticSensor(runtime, desc)
+
+        self.assertIsNone(entity.native_value)
+
+    async def test_sensor_available_reflects_command_support(self) -> None:
+        runtime = self._runtime()
+        desc = self.sensor_module.SENSOR_DESCRIPTIONS[0]
+        entity = self.sensor_module.OnkyoLegacyDiagnosticSensor(runtime, desc)
+        runtime.coordinator.last_update_success = True
+
+        self.assertTrue(entity.available)
+
+        runtime.coordinator.set_command_capability("IFA", False)
+        self.assertFalse(entity.available)
+
+    async def test_tuner_sensor_native_value_returns_frequency(self) -> None:
+        runtime = self._tx8050_runtime()
+        entity = self.sensor_module.OnkyoLegacyTunerSensor(runtime)
+
+        self.assertEqual(entity.native_value, 10710)
+
+    async def test_tuner_sensor_native_value_returns_none_when_no_frequency(self) -> None:
+        runtime = self._tx8050_runtime()
+        runtime.coordinator.data = self.coordinator_module.OnkyoState(
+            power=True,
+            volume=30,
+            muted=True,
+            source="net",
+            tuner_frequency=None,
+        )
+        entity = self.sensor_module.OnkyoLegacyTunerSensor(runtime)
+
+        self.assertIsNone(entity.native_value)

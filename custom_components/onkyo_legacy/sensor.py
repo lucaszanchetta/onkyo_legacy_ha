@@ -14,6 +14,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import OnkyoRuntimeData
 
+__all__ = ["async_setup_entry"]
+
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticSensorDescription(SensorEntityDescription):

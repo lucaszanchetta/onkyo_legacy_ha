@@ -274,3 +274,92 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("LMD", "stereo"), calls)
         self.assertIn(("refresh", ""), calls)
         self.assertIn(("refresh", ""), zone2.coordinator.calls)
+
+    async def test_detect_supported_zones_skips_failing_zone2(self) -> None:
+        self_outer = self
+        runtime = type("Runtime", (), {})()
+        runtime.zone_label = "Main"
+        runtime.host = "192.168.1.23"
+        runtime.port = 60128
+
+        zone2_runtime = type("ZoneRuntime", (), {})()
+        zone2_runtime.zone_label = "Zone 2"
+        zone2_runtime.host = "192.168.1.23"
+        zone2_runtime.port = 60128
+
+        class FailingCoordinator:
+            def __init__(self) -> None:
+                self.hass = self_outer.hass
+
+            def _query_core_state(self) -> tuple[str, str, str, str]:
+                raise TimeoutError("no response")
+
+        zone2_runtime.coordinator = FailingCoordinator()
+        runtime.candidate_zones = (zone2_runtime,)
+
+        zones = await self.init_module._async_detect_supported_zones(runtime)
+
+        self.assertEqual([zone.zone_label for zone in zones], ["Main"])
+
+    async def test_detect_supported_zones_includes_successful_zone2(self) -> None:
+        self_outer = self
+        runtime = type("Runtime", (), {})()
+        runtime.zone_label = "Main"
+        runtime.host = "192.168.1.23"
+        runtime.port = 60128
+
+        zone2_runtime = type("ZoneRuntime", (), {})()
+        zone2_runtime.zone_label = "Zone 2"
+        zone2_runtime.host = "192.168.1.23"
+        zone2_runtime.port = 60128
+
+        class SuccessCoordinator:
+            def __init__(self) -> None:
+                self.hass = self_outer.hass
+
+            def _query_core_state(self) -> tuple[str, str, str, str]:
+                return ("PWR01", "MVL00", "AMT00", "SLI00")
+
+        zone2_runtime.coordinator = SuccessCoordinator()
+        runtime.candidate_zones = (zone2_runtime,)
+
+        zones = await self.init_module._async_detect_supported_zones(runtime)
+
+        self.assertEqual([zone.zone_label for zone in zones], ["Main", "Zone 2"])
+
+    async def test_config_flow_import_uses_model_default_name_when_name_missing(self) -> None:
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+
+        result = await flow.async_step_import(
+            {
+                "host": "192.168.1.23",
+                "port": 60128,
+                "model": "PR-SC5507",
+                "scan_interval": 10,
+                "max_volume": 80,
+                "sources": {"HTPC": "vcr"},
+            }
+        )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["title"], "Onkyo PR-SC5507")
+
+    async def test_config_flow_import_populates_retries_and_strict_sources(self) -> None:
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+
+        result = await flow.async_step_import(
+            {
+                "host": "192.168.1.23",
+                "port": 60128,
+                "name": "Onkyo PR-SC5507",
+                "model": "PR-SC5507",
+                "scan_interval": 10,
+                "max_volume": 80,
+                "sources": {"HTPC": "vcr"},
+                "retries": 3,
+                "strict_sources": False,
+            }
+        )
+
+        self.assertEqual(result["data"]["retries"], 3)
+        self.assertFalse(result["data"]["strict_sources"])

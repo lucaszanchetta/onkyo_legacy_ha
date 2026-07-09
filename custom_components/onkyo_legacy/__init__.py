@@ -11,17 +11,22 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import (
     ATTR_LISTENING_MODE,
-    CONF_MODEL,
     CONF_MAX_VOLUME,
+    CONF_MODEL,
+    CONF_RETRIES,
     CONF_SCAN_INTERVAL,
     CONF_SOURCES,
-    DEFAULT_MODEL,
+    CONF_STRICT_SOURCES,
     DEFAULT_MAX_VOLUME,
+    DEFAULT_MODEL,
     DEFAULT_PORT,
+    DEFAULT_RETRIES,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_STRICT_SOURCES,
     DOMAIN,
     PLATFORMS,
     PROFILE_DEFAULT_NAMES,
@@ -31,6 +36,8 @@ from .const import (
     SERVICE_SET_LISTENING_MODE,
 )
 from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, build_runtime_data
+
+__all__ = ["async_setup", "async_setup_entry", "async_unload_entry"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +98,10 @@ DEVICE_SCHEMA = vol.Schema(
         vol.Optional(CONF_MAX_VOLUME, default=DEFAULT_MAX_VOLUME): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=200)
         ),
+        vol.Optional(CONF_RETRIES, default=DEFAULT_RETRIES): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=5)
+        ),
+        vol.Optional(CONF_STRICT_SOURCES, default=DEFAULT_STRICT_SOURCES): cv.boolean,
         vol.Optional(CONF_SOURCES): {
             cv.string: cv.string,
         },
@@ -135,6 +146,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         scan_interval=entry.data[CONF_SCAN_INTERVAL],
         sources=entry.data.get(CONF_SOURCES) or PROFILE_DEFAULT_SOURCES[model],
         max_volume=entry.data[CONF_MAX_VOLUME],
+        retries=entry.data.get(CONF_RETRIES, DEFAULT_RETRIES),
+        strict_sources=entry.data.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
     )
 
     for command in runtime.queryable_commands:
@@ -156,7 +169,7 @@ async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
     """Perform a best-effort first refresh without blocking setup."""
     try:
         await runtime.coordinator.async_refresh()
-    except Exception as err:
+    except (UpdateFailed, OSError, ConnectionError) as err:
         _LOGGER.warning(
             "Initial state refresh failed for %s:%s: %s",
             runtime.host,
@@ -174,7 +187,7 @@ async def _async_detect_supported_zones(
             await zone_runtime.coordinator.hass.async_add_executor_job(
                 zone_runtime.coordinator._query_core_state
             )
-        except Exception as err:
+        except (OSError, TimeoutError, ConnectionError, ValueError) as err:
             _LOGGER.info(
                 "Skipping %s on %s:%s because core queries failed: %s",
                 zone_runtime.zone_label,

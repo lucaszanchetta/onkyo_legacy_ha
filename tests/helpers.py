@@ -145,6 +145,7 @@ def install_stubs() -> None:
     cv.string = _identity
     cv.port = _identity
     cv.entity_id = _identity
+    cv.boolean = _identity
     cv.ensure_list = lambda value: value if isinstance(value, list) else [value]
     sys.modules["homeassistant.helpers.config_validation"] = cv
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
+import time
 from threading import Lock
 from typing import Any
 
@@ -24,6 +25,18 @@ from .const import (
     PROFILE_QUERYABLE_COMMANDS,
     PROFILE_SUPPORTED_ZONES,
 )
+
+__all__ = [
+    "OnkyoLegacyClient",
+    "OnkyoLegacyCoordinator",
+    "OnkyoRuntimeData",
+    "OnkyoZoneRuntimeData",
+    "OnkyoState",
+    "ZoneDefinition",
+    "ZONE_DEFINITIONS",
+    "SOURCE_MAPS",
+    "build_runtime_data",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +123,83 @@ OPTION_RAW_EXCLUSIONS: dict[str, set[str]] = {
     "DIM": {"DIM", "QSTN", "03", "08"},
 }
 
+_OPTIONAL_ATTR_MAP: dict[str, str] = {
+    "SLA": "audio_selector",
+    "LMD": "listening_mode",
+    "LTN": "late_night_mode",
+    "RAS": "cinema_filter",
+    "ADQ": "audyssey_dynamic_eq",
+    "ADV": "audyssey_dynamic_volume",
+    "MOT": "music_optimizer",
+    "TGA": "trigger_a",
+    "TGB": "trigger_b",
+    "TGC": "trigger_c",
+    "DIM": "dimmer_level",
+    "CTL": "center_level",
+    "SWL": "subwoofer_level",
+    "IFA": "audio_information",
+    "IFV": "video_information",
+}
+
+_OPTIONAL_MODE_COMMANDS: tuple[tuple[str, dict[str, str] | None], ...] = (
+    ("SLA", AUDIO_SELECTOR_RAW_TO_NAME),
+    ("LMD", None),
+    ("LTN", LATE_NIGHT_RAW_TO_NAME),
+    ("DIM", DIMMER_RAW_TO_NAME),
+    ("ADV", AUDYSSEY_VOLUME_RAW_TO_NAME),
+)
+_OPTIONAL_SWITCH_COMMANDS: tuple[tuple[str, dict[str, str]], ...] = (
+    ("RAS", CINEMA_FILTER_RAW_TO_NAME),
+    ("ADQ", AUDYSSEY_EQ_RAW_TO_NAME),
+    ("MOT", MUSIC_OPTIMIZER_RAW_TO_NAME),
+    ("TGA", TRIGGER_A_RAW_TO_NAME),
+    ("TGB", TRIGGER_B_RAW_TO_NAME),
+    ("TGC", TRIGGER_C_RAW_TO_NAME),
+)
+_OPTIONAL_SLEEP_COMMANDS: tuple[str, ...] = ("SLP",)
+_OPTIONAL_LEVEL_COMMANDS: tuple[str, ...] = ("CTL", "SWL")
+_OPTIONAL_TUNER_COMMANDS: tuple[str, ...] = ("TUN",)
+_OPTIONAL_INFORMATION_COMMANDS: tuple[str, ...] = ("IFA", "IFV")
+
+
+def _apply_previous_fallbacks(state: OnkyoState, previous: OnkyoState) -> OnkyoState:
+    """Fill in None/empty optional fields from the previous state."""
+    if state.audio_selector is None:
+        state.audio_selector = previous.audio_selector
+    if state.listening_mode is None:
+        state.listening_mode = previous.listening_mode
+    if state.late_night_mode is None:
+        state.late_night_mode = previous.late_night_mode
+    if state.cinema_filter is None:
+        state.cinema_filter = previous.cinema_filter
+    if state.audyssey_dynamic_eq is None:
+        state.audyssey_dynamic_eq = previous.audyssey_dynamic_eq
+    if state.audyssey_dynamic_volume is None:
+        state.audyssey_dynamic_volume = previous.audyssey_dynamic_volume
+    if state.music_optimizer is None:
+        state.music_optimizer = previous.music_optimizer
+    if state.trigger_a is None:
+        state.trigger_a = previous.trigger_a
+    if state.trigger_b is None:
+        state.trigger_b = previous.trigger_b
+    if state.trigger_c is None:
+        state.trigger_c = previous.trigger_c
+    if state.dimmer_level is None:
+        state.dimmer_level = previous.dimmer_level
+    if state.sleep_minutes is None:
+        state.sleep_minutes = previous.sleep_minutes
+    if state.center_level is None:
+        state.center_level = previous.center_level
+    if state.subwoofer_level is None:
+        state.subwoofer_level = previous.subwoofer_level
+    if state.tuner_frequency is None:
+        state.tuner_frequency = previous.tuner_frequency
+    if not state.audio_information:
+        state.audio_information = dict(previous.audio_information)
+    if not state.video_information:
+        state.video_information = dict(previous.video_information)
+    return state
+
 
 @dataclass(frozen=True, slots=True)
 class ZoneDefinition:
@@ -150,7 +240,7 @@ class OnkyoState:
     trigger_b: bool | None = None
     trigger_c: bool | None = None
     dimmer_level: str | None = None
-    sleep_minutes: int = 0
+    sleep_minutes: int | None = None
     center_level: int | None = None
     subwoofer_level: int | None = None
     tuner_frequency: int | None = None
@@ -161,11 +251,16 @@ class OnkyoState:
 class OnkyoLegacyClient:
     """Thread-safe synchronous ISCP client."""
 
-    def __init__(self, host: str, port: int) -> None:
+    _RETRYABLE_ERRORS = (OSError, TimeoutError, ConnectionError)
+
+    def __init__(self, host: str, port: int, retries: int = 2) -> None:
         self._host = host
         self._port = port
         self._device: eISCP | None = None
         self._lock = Lock()
+        self._retries = max(1, retries)
+        self._consecutive_failures = 0
+        self._circuit_open_until: float = 0.0
 
     def disconnect(self) -> None:
         """Disconnect the underlying socket."""
@@ -181,6 +276,10 @@ class OnkyoLegacyClient:
         """Query a command and return the raw response."""
         return self._with_retry(self._query_once, command)
 
+    def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
+        """Query multiple commands in a single lock acquisition."""
+        return self._with_retry(self._query_batch_once, commands)
+
     def send(self, command: str, value: str) -> None:
         """Send a raw command without waiting for an acknowledgement."""
         self._with_retry(self._send_once, command, value)
@@ -194,20 +293,54 @@ class OnkyoLegacyClient:
         with self._lock:
             return self._connect().raw(f"{command}QSTN")
 
+    def _query_batch_once(self, commands: tuple[str, ...]) -> dict[str, str]:
+        with self._lock:
+            device = self._connect()
+            results: dict[str, str] = {}
+            for command in commands:
+                try:
+                    results[command] = device.raw(f"{command}QSTN")
+                except self._RETRYABLE_ERRORS:
+                    _LOGGER.debug("Command %s failed in batch, aborting batch", command)
+                    try:
+                        device.disconnect()
+                    except OSError:
+                        pass
+                    self._device = None
+                    break
+            return results
+
     def _send_once(self, command: str, value: str) -> None:
         with self._lock:
             self._connect().send(f"{command}{value}")
 
     def _with_retry(self, method: Any, *args: Any) -> Any:
+        now = time.monotonic()
+        if now < self._circuit_open_until:
+            raise ConnectionError(
+                f"Circuit breaker open for {self._host}:{self._port}"
+            )
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self._retries):
             try:
                 return method(*args)
-            except Exception as err:  # broad to recover from socket/lib failures
+            except self._RETRYABLE_ERRORS as err:
                 last_error = err
-                _LOGGER.debug("ISCP command failed on attempt %s: %s", attempt + 1, err)
+                _LOGGER.debug(
+                    "ISCP command failed on attempt %s/%s: %s",
+                    attempt + 1, self._retries, err,
+                )
                 self.disconnect()
+                if attempt < self._retries - 1:
+                    time.sleep(min(2 ** attempt, 8))
         assert last_error is not None
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 5:
+            self._circuit_open_until = time.monotonic() + 30.0
+            _LOGGER.warning(
+                "Circuit breaker opened for %s:%s after %s consecutive failures",
+                self._host, self._port, self._consecutive_failures,
+            )
         raise last_error
 
 
@@ -286,164 +419,110 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         return await self._async_probe_optional(command)
 
     async def _async_update_data(self) -> OnkyoState:
-        """Fetch the latest state from the device."""
+        """Fetch the latest state from the device using batched queries."""
+        core_commands = (
+            self.zone.power_command,
+            self.zone.volume_command,
+            self.zone.mute_command,
+            self.zone.source_command,
+        )
+        optional_commands = self._optional_command_set()
+        all_commands = core_commands + tuple(optional_commands)
+
         try:
-            power_raw, volume_raw, mute_raw, source_raw = await self.hass.async_add_executor_job(
-                self._query_core_state
+            results: dict[str, str] = await self.hass.async_add_executor_job(
+                self.client.query_batch, all_commands
             )
         except Exception as err:
-            raise UpdateFailed(f"Core state refresh failed: {err}") from err
+            raise UpdateFailed(f"State refresh failed: {err}") from err
+
+        for cmd in core_commands:
+            if cmd not in results:
+                raise UpdateFailed(f"Core command {cmd} missing from batch response")
 
         state = OnkyoState(
-            power=_parse_power(power_raw, self.zone.power_command),
-            volume=_parse_volume(volume_raw, self.zone.volume_command),
-            muted=_parse_mute(mute_raw, self.zone.mute_command),
-            source=_parse_enum(source_raw, self.source_raw_to_name),
+            power=_parse_power(results[self.zone.power_command], self.zone.power_command),
+            volume=_parse_volume(results[self.zone.volume_command], self.zone.volume_command),
+            muted=_parse_mute(results[self.zone.mute_command], self.zone.mute_command),
+            source=_parse_enum(results[self.zone.source_command], self.source_raw_to_name),
         )
         if self.zone.key != "main":
             return state
 
         previous = self.data or OnkyoState()
 
-        if self.supports("SLA"):
-            state.audio_selector = await self._async_query_optional_mode(
-                "SLA", AUDIO_SELECTOR_RAW_TO_NAME
-            )
-            if state.audio_selector is None:
-                state.audio_selector = previous.audio_selector
-        else:
-            state.audio_selector = previous.audio_selector
+        for command, value_map in _OPTIONAL_MODE_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME))
 
-        if self.supports("LMD"):
-            state.listening_mode = await self._async_query_optional_mode("LMD")
-            if state.listening_mode is None:
-                state.listening_mode = previous.listening_mode
-        else:
-            state.listening_mode = previous.listening_mode
+        for command, value_map in _OPTIONAL_SWITCH_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_switch(raw, value_map))
 
-        if self.supports("LTN"):
-            state.late_night_mode = await self._async_query_optional_mode(
-                "LTN", LATE_NIGHT_RAW_TO_NAME
-            )
-            if state.late_night_mode is None:
-                state.late_night_mode = previous.late_night_mode
-        else:
-            state.late_night_mode = previous.late_night_mode
+        for command in _OPTIONAL_SLEEP_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                state.sleep_minutes = _parse_sleep(raw)
 
-        if self.supports("RAS"):
-            state.cinema_filter = await self._async_query_optional_switch(
-                "RAS", CINEMA_FILTER_RAW_TO_NAME
-            )
-            if state.cinema_filter is None:
-                state.cinema_filter = previous.cinema_filter
-        else:
-            state.cinema_filter = previous.cinema_filter
+        for command in _OPTIONAL_LEVEL_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_signed_level(raw))
 
-        if self.supports("ADQ"):
-            state.audyssey_dynamic_eq = await self._async_query_optional_switch(
-                "ADQ", AUDYSSEY_EQ_RAW_TO_NAME
-            )
-            if state.audyssey_dynamic_eq is None:
-                state.audyssey_dynamic_eq = previous.audyssey_dynamic_eq
-        else:
-            state.audyssey_dynamic_eq = previous.audyssey_dynamic_eq
+        for command in _OPTIONAL_TUNER_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                state.tuner_frequency = _parse_tuner_frequency(raw)
 
-        if self.supports("ADV"):
-            state.audyssey_dynamic_volume = await self._async_query_optional_mode(
-                "ADV", AUDYSSEY_VOLUME_RAW_TO_NAME
-            )
-            if state.audyssey_dynamic_volume is None:
-                state.audyssey_dynamic_volume = previous.audyssey_dynamic_volume
-        else:
-            state.audyssey_dynamic_volume = previous.audyssey_dynamic_volume
+        for command in _OPTIONAL_INFORMATION_COMMANDS:
+            if not self.supports(command):
+                continue
+            raw = results.get(command)
+            if raw is not None:
+                setattr(state, _OPTIONAL_ATTR_MAP[command], _INFORMATION_PARSERS[command](raw))
 
-        if self.supports("MOT"):
-            state.music_optimizer = await self._async_query_optional_switch(
-                "MOT", MUSIC_OPTIMIZER_RAW_TO_NAME
-            )
-            if state.music_optimizer is None:
-                state.music_optimizer = previous.music_optimizer
-        else:
-            state.music_optimizer = previous.music_optimizer
-
-        if self.supports("TGA"):
-            state.trigger_a = await self._async_query_optional_switch("TGA", TRIGGER_A_RAW_TO_NAME)
-            if state.trigger_a is None:
-                state.trigger_a = previous.trigger_a
-        else:
-            state.trigger_a = previous.trigger_a
-
-        if self.supports("TGB"):
-            state.trigger_b = await self._async_query_optional_switch("TGB", TRIGGER_B_RAW_TO_NAME)
-            if state.trigger_b is None:
-                state.trigger_b = previous.trigger_b
-        else:
-            state.trigger_b = previous.trigger_b
-
-        if self.supports("TGC"):
-            state.trigger_c = await self._async_query_optional_switch("TGC", TRIGGER_C_RAW_TO_NAME)
-            if state.trigger_c is None:
-                state.trigger_c = previous.trigger_c
-        else:
-            state.trigger_c = previous.trigger_c
-
-        if self.supports("DIM"):
-            state.dimmer_level = await self._async_query_optional_mode("DIM", DIMMER_RAW_TO_NAME)
-            if state.dimmer_level is None:
-                state.dimmer_level = previous.dimmer_level
-        else:
-            state.dimmer_level = previous.dimmer_level
-
-        if self.supports("SLP"):
-            state.sleep_minutes = await self._async_query_optional_sleep("SLP")
-            if state.sleep_minutes is None:
-                state.sleep_minutes = previous.sleep_minutes
-        else:
-            state.sleep_minutes = previous.sleep_minutes
-
-        if self.supports("CTL"):
-            state.center_level = await self._async_query_optional_level("CTL")
-            if state.center_level is None:
-                state.center_level = previous.center_level
-        else:
-            state.center_level = previous.center_level
-
-        if self.supports("SWL"):
-            state.subwoofer_level = await self._async_query_optional_level("SWL")
-            if state.subwoofer_level is None:
-                state.subwoofer_level = previous.subwoofer_level
-        else:
-            state.subwoofer_level = previous.subwoofer_level
-
-        if self.supports("TUN"):
-            state.tuner_frequency = await self._async_query_optional_tuner("TUN")
-            if state.tuner_frequency is None:
-                state.tuner_frequency = previous.tuner_frequency
-        else:
-            state.tuner_frequency = previous.tuner_frequency
-
-        if self.supports("IFA"):
-            state.audio_information = await self._async_query_optional_information(
-                "IFA", _parse_audio_information
-            )
-            if not state.audio_information:
-                state.audio_information = dict(previous.audio_information)
-        else:
-            state.audio_information = dict(previous.audio_information)
-
-        if self.supports("IFV"):
-            state.video_information = await self._async_query_optional_information(
-                "IFV", _parse_video_information
-            )
-            if not state.video_information:
-                state.video_information = dict(previous.video_information)
-        else:
-            state.video_information = dict(previous.video_information)
-
+        state = _apply_previous_fallbacks(state, previous)
         state.listening_mode = _resolve_listening_mode_display(
             state.listening_mode, state.audio_information
         )
         return state
+
+    def _optional_command_set(self) -> set[str]:
+        """Return the set of optional ISCP commands to query for this zone."""
+        commands: set[str] = set()
+        if self.zone.key != "main":
+            return commands
+        for command, _ in _OPTIONAL_MODE_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        for command, _ in _OPTIONAL_SWITCH_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        for command in _OPTIONAL_SLEEP_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        for command in _OPTIONAL_LEVEL_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        for command in _OPTIONAL_TUNER_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        for command in _OPTIONAL_INFORMATION_COMMANDS:
+            if self.supports(command):
+                commands.add(command)
+        return commands
 
     def _query_core_state(self) -> tuple[str, str, str, str]:
         return (
@@ -460,62 +539,6 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             _LOGGER.info("%s does not respond to %s queries: %s", self.host, command, err)
             return False
         return True
-
-    async def _async_query_optional_mode(
-        self, command: str, value_map: dict[str, str] | None = None
-    ) -> str | None:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return None
-        return _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME)
-
-    async def _async_query_optional_switch(
-        self, command: str, value_map: dict[str, str]
-    ) -> bool | None:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return None
-        return _parse_switch(raw, value_map)
-
-    async def _async_query_optional_sleep(self, command: str) -> int | None:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return None
-        return _parse_sleep(raw)
-
-    async def _async_query_optional_level(self, command: str) -> int | None:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return None
-        return _parse_signed_level(raw)
-
-    async def _async_query_optional_tuner(self, command: str) -> int | None:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return None
-        return _parse_tuner_frequency(raw)
-
-    async def _async_query_optional_information(
-        self,
-        command: str,
-        parser: Any,
-    ) -> dict[str, str]:
-        try:
-            raw = await self.hass.async_add_executor_job(self.client.query, command)
-        except Exception as err:
-            _LOGGER.debug("Optional %s query failed for %s: %s", command, self.host, err)
-            return {}
-        return parser(raw)
 
     async def async_turn_on(self) -> None:
         await self._async_send(self.zone.power_command, "01")
@@ -586,11 +609,21 @@ def build_runtime_data(
     scan_interval: int,
     sources: dict[str, str],
     max_volume: int,
+    retries: int = 2,
+    strict_sources: bool = True,
 ) -> OnkyoRuntimeData:
     """Build runtime data for one configured device."""
     normalized_model = _normalize_model(model)
-    normalized_sources = _normalize_sources(sources or PROFILE_DEFAULT_SOURCES[normalized_model])
-    client = OnkyoLegacyClient(host, port)
+    normalized_sources, skipped = _normalize_sources(
+        sources or PROFILE_DEFAULT_SOURCES[normalized_model],
+        strict=strict_sources,
+    )
+    if skipped:
+        _LOGGER.warning(
+            "Skipped %d unknown source(s) for %s: %s",
+            len(skipped), host, ", ".join(sorted(skipped)),
+        )
+    client = OnkyoLegacyClient(host, port, retries=retries)
     entity_ids: set[str] = set()
     device_info = {
         "identifiers": {(DOMAIN, host)},
@@ -749,9 +782,14 @@ def _parse_tuner_frequency(response: str) -> int:
     return int(code)
 
 
-def _normalize_sources(sources: dict[str, str]) -> dict[str, str]:
+def _normalize_sources(
+    sources: dict[str, str],
+    *,
+    strict: bool = True,
+) -> tuple[dict[str, str], set[str]]:
     source_raw_to_name, source_name_to_raw = SOURCE_MAPS["main"]
     normalized: dict[str, str] = {}
+    skipped: set[str] = set()
     for label, alias in sources.items():
         raw = alias.upper()
         if raw in source_raw_to_name:
@@ -761,10 +799,14 @@ def _normalize_sources(sources: dict[str, str]) -> dict[str, str]:
 
         normalized_alias = alias.lower()
         if normalized_alias not in source_name_to_raw:
-            raise UpdateFailed(f"Unsupported source alias in configuration: {alias}")
+            if strict:
+                raise UpdateFailed(f"Unsupported source alias in configuration: {alias}")
+            _LOGGER.warning("Skipping unknown source alias %r in configuration", alias)
+            skipped.add(alias)
+            continue
         canonical_alias = source_raw_to_name[source_name_to_raw[normalized_alias]]
         normalized[_display_source_name(canonical_alias)] = canonical_alias
-    return normalized
+    return normalized, skipped
 
 
 def _build_source_lookup(
@@ -872,6 +914,12 @@ def _parse_video_information(response: str) -> dict[str, str]:
             "picture_mode",
         ),
     )
+
+
+_INFORMATION_PARSERS: dict[str, Any] = {
+    "IFA": _parse_audio_information,
+    "IFV": _parse_video_information,
+}
 
 
 def _split_information(payload: str, fields: tuple[str, ...]) -> dict[str, str]:
