@@ -389,6 +389,10 @@ def install_stubs() -> None:
         async def async_request_refresh(self) -> None:
             await self.async_refresh()
 
+        def async_set_updated_data(self, data: Any) -> None:
+            self.data = data
+            self.last_update_success = True
+
     class CoordinatorEntity:
         def __init__(self, coordinator: DataUpdateCoordinator) -> None:
             self.coordinator = coordinator
@@ -505,6 +509,7 @@ class FakeHass:
         self.data: dict[str, Any] = {}
         self.services = FakeServices()
         self.bus = FakeBus()
+        self.loop = types.SimpleNamespace(call_soon_threadsafe=lambda fn, *args: None)
         self.created_tasks: list[Any] = []
         self.config_entries = FakeConfigEntries()
 

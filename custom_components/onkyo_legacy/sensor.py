@@ -21,6 +21,7 @@ __all__ = ["async_setup_entry"]
 class DiagnosticSensorDescription(SensorEntityDescription):
     data_attr: str = ""
     key_name: str = ""
+    command: str = ""
 
 
 SENSOR_DESCRIPTIONS = (
@@ -94,6 +95,22 @@ SENSOR_DESCRIPTIONS = (
         key_name="picture_mode",
         icon="mdi:image-filter-center-focus",
     ),
+    DiagnosticSensorDescription(
+        key="video_resolution",
+        name="Video Resolution",
+        icon="mdi:resolution",
+        data_attr="video_information",
+        key_name="video_resolution",
+        command="RES",
+    ),
+    DiagnosticSensorDescription(
+        key="hdmi_output",
+        name="HDMI Output",
+        icon="mdi:video-input-hdmi",
+        data_attr="video_information",
+        key_name="hdmi_output",
+        command="HDO",
+    ),
 )
 
 
@@ -106,7 +123,9 @@ async def async_setup_entry(
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
     entities = []
     for description in SENSOR_DESCRIPTIONS:
-        command = "IFA" if description.data_attr == "audio_information" else "IFV"
+        command = description.command
+        if not command:
+            command = "IFA" if description.data_attr == "audio_information" else "IFV"
         if runtime.coordinator.supports(command):
             entities.append(OnkyoLegacyDiagnosticSensor(runtime, description))
 
@@ -149,7 +168,9 @@ class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        command = "IFA" if self.entity_description.data_attr == "audio_information" else "IFV"
+        command = self.entity_description.command
+        if not command:
+            command = "IFA" if self.entity_description.data_attr == "audio_information" else "IFV"
         return self.coordinator.last_update_success and self.coordinator.supports(command)
 
 

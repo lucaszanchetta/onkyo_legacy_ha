@@ -187,6 +187,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime.zones = await _async_detect_supported_zones(runtime)
     _propagate_zone_command_capabilities(runtime)
     hass.async_create_task(_async_initial_refresh(runtime))
+    runtime.coordinator.client.start_listener(runtime.coordinator._handle_push_message)
 
     hass.data[DOMAIN][entry.entry_id] = runtime
     await _async_migrate_main_entity_unique_ids(hass, runtime.host)
@@ -250,6 +251,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     runtime = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if runtime is not None:
+        runtime.coordinator.client.stop_listener()
         runtime.coordinator.client.disconnect()
     return unload_ok
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
+import threading
 import time
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 from eiscp import eISCP
 from eiscp import commands as eiscp_commands
@@ -140,6 +141,8 @@ _OPTIONAL_ATTR_MAP: dict[str, str] = {
     "SWL": "subwoofer_level",
     "IFA": "audio_information",
     "IFV": "video_information",
+    "RES": "video_information",
+    "HDO": "video_information",
 }
 
 _OPTIONAL_MODE_COMMANDS: tuple[tuple[str, dict[str, str] | None], ...] = (
@@ -160,7 +163,8 @@ _OPTIONAL_SWITCH_COMMANDS: tuple[tuple[str, dict[str, str]], ...] = (
 _OPTIONAL_SLEEP_COMMANDS: tuple[str, ...] = ("SLP",)
 _OPTIONAL_LEVEL_COMMANDS: tuple[str, ...] = ("CTL", "SWL")
 _OPTIONAL_TUNER_COMMANDS: tuple[str, ...] = ("TUN",)
-_OPTIONAL_INFORMATION_COMMANDS: tuple[str, ...] = ("IFA", "IFV")
+_OPTIONAL_INFORMATION_COMMANDS: tuple[str, ...] = ("IFA", "IFV", "RES", "HDO")
+_SINGLE_VALUE_INFORMATION: tuple[str, ...] = ("RES", "HDO")
 
 
 def _apply_previous_fallbacks(state: OnkyoState, previous: OnkyoState) -> OnkyoState:
@@ -263,9 +267,17 @@ class OnkyoLegacyClient:
         self._retries = max(1, retries)
         self._consecutive_failures = 0
         self._circuit_open_until: float = 0.0
+        self._listener_thread: threading.Thread | None = None
+        self._listener_stop: threading.Event = threading.Event()
+        self._push_callback: Callable[[str], None] | None = None
 
     def disconnect(self) -> None:
         """Disconnect the underlying socket."""
+        # Avoid joining ourselves — the listener thread calls into
+        # disconnect() only via the error-handler path, which manages
+        # the device itself.  This guard is a safety net.
+        if threading.current_thread() is not self._listener_thread:
+            self.stop_listener()
         with self._lock:
             if self._device is not None:
                 try:
@@ -306,6 +318,67 @@ class OnkyoLegacyClient:
         if self._device is None:
             self._device = eISCP(self._host, self._port)
         return self._device
+
+    def start_listener(self, callback: Callable[[str], None]) -> None:
+        """Start background listener thread for unsolicited ISCP messages."""
+        if self._listener_thread is not None:
+            return
+        self._listener_stop.clear()
+        self._push_callback = callback
+        self._listener_thread = threading.Thread(
+            target=self._listen_loop,
+            name=f"iscp-listener-{self._host}",
+            daemon=True,
+        )
+        self._listener_thread.start()
+
+    def stop_listener(self) -> None:
+        """Stop the background listener thread."""
+        if self._listener_thread is None:
+            return
+        self._listener_stop.set()
+        self._listener_thread.join(timeout=5.0)
+        self._listener_thread = None
+        self._push_callback = None
+
+    def _listen_loop(self) -> None:
+        """Background thread: listen for unsolicited ISCP messages."""
+        _LOGGER.info("Starting ISCP listener for %s:%s", self._host, self._port)
+        while not self._listener_stop.is_set():
+            try:
+                with self._lock:
+                    device = self._connect()
+                message = device.get(timeout=1.0)
+                if message and self._push_callback:
+                    self._push_callback(message)
+            except TimeoutError:
+                continue
+            except (OSError, ConnectionError) as err:
+                _LOGGER.debug("Listener connection error, will retry: %s", err)
+                # Disconnect device directly without calling self.disconnect()
+                # to avoid attempting to join the current thread from within
+                # the listener thread itself.
+                with self._lock:
+                    if self._device is not None:
+                        try:
+                            self._device.disconnect()
+                        except OSError:
+                            pass
+                        self._device = None
+                if not self._listener_stop.is_set():
+                    time.sleep(2.0)
+            except Exception as err:
+                _LOGGER.warning("Unexpected listener error: %s", err)
+                with self._lock:
+                    if self._device is not None:
+                        try:
+                            self._device.disconnect()
+                        except OSError:
+                            pass
+                        self._device = None
+                if not self._listener_stop.is_set():
+                    time.sleep(2.0)
+        _LOGGER.info("ISCP listener stopped for %s:%s", self._host, self._port)
 
     def _query_once(self, command: str) -> str:
         with self._lock:
@@ -518,7 +591,12 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 continue
             raw = results.get(command)
             if raw is not None:
-                setattr(state, _OPTIONAL_ATTR_MAP[command], _INFORMATION_PARSERS[command](raw))
+                if command in _SINGLE_VALUE_INFORMATION:
+                    attr_name = _OPTIONAL_ATTR_MAP[command]
+                    existing = getattr(state, attr_name)
+                    existing.update(_INFORMATION_PARSERS[command](raw))
+                else:
+                    setattr(state, _OPTIONAL_ATTR_MAP[command], _INFORMATION_PARSERS[command](raw))
 
         state = _apply_previous_fallbacks(state, previous)
         state.listening_mode = _resolve_listening_mode_display(
@@ -620,6 +698,76 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
     async def async_set_level(self, command: str, level: int) -> None:
         raw = _encode_signed_level(level)
         await self._async_send(command, raw)
+
+    def _handle_push_message(self, message: str) -> None:
+        """Handle an unsolicited ISCP message from the listener thread."""
+        if len(message) < 3:
+            return
+        prefix = message[:3]
+
+        updated = False
+        if prefix == self.zone.power_command:
+            self.data = OnkyoState(
+                power=_parse_power(message, prefix),
+                volume=self.data.volume,
+                muted=self.data.muted,
+                source=self.data.source,
+                **self._optional_state_dict(),
+            )
+            updated = True
+        elif prefix == self.zone.volume_command:
+            self.data = OnkyoState(
+                power=self.data.power,
+                volume=_parse_volume(message, prefix),
+                muted=self.data.muted,
+                source=self.data.source,
+                **self._optional_state_dict(),
+            )
+            updated = True
+        elif prefix == self.zone.mute_command:
+            self.data = OnkyoState(
+                power=self.data.power,
+                volume=self.data.volume,
+                muted=_parse_mute(message, prefix),
+                source=self.data.source,
+                **self._optional_state_dict(),
+            )
+            updated = True
+        elif prefix == self.zone.source_command:
+            self.data = OnkyoState(
+                power=self.data.power,
+                volume=self.data.volume,
+                muted=self.data.muted,
+                source=_parse_enum(message, self.source_raw_to_name),
+                **self._optional_state_dict(),
+            )
+            updated = True
+
+        if updated:
+            _LOGGER.debug("Push update: %s -> %s", prefix, message[3:])
+            self.hass.loop.call_soon_threadsafe(self.async_set_updated_data, self.data)
+
+    def _optional_state_dict(self) -> dict[str, Any]:
+        """Copy optional fields from current state for partial updates."""
+        return {
+            "listening_mode": self.data.listening_mode,
+            "dimmer_level": self.data.dimmer_level,
+            "audio_selector": self.data.audio_selector,
+            "late_night_mode": self.data.late_night_mode,
+            "audyssey_dynamic_volume": self.data.audyssey_dynamic_volume,
+            "cinema_filter": self.data.cinema_filter,
+            "audyssey_dynamic_eq": self.data.audyssey_dynamic_eq,
+            "music_optimizer": self.data.music_optimizer,
+            "trigger_a": self.data.trigger_a,
+            "trigger_b": self.data.trigger_b,
+            "trigger_c": self.data.trigger_c,
+            "sleep_minutes": self.data.sleep_minutes,
+            "center_level": self.data.center_level,
+            "subwoofer_level": self.data.subwoofer_level,
+            "tuner_frequency": self.data.tuner_frequency,
+            "audio_information": self.data.audio_information,
+            "video_information": self.data.video_information,
+        }
 
     async def async_set_boolean_option(self, command: str, enabled: bool) -> None:
         await self._async_send(command, "01" if enabled else "00")
@@ -952,9 +1100,21 @@ def _parse_video_information(response: str) -> dict[str, str]:
     )
 
 
+def _parse_resolution(response: str) -> dict[str, str]:
+    payload = _payload_code(response, "RES")
+    return {"video_resolution": payload}
+
+
+def _parse_hdmi_output(response: str) -> dict[str, str]:
+    payload = _payload_code(response, "HDO")
+    return {"hdmi_output": payload}
+
+
 _INFORMATION_PARSERS: dict[str, Any] = {
     "IFA": _parse_audio_information,
     "IFV": _parse_video_information,
+    "RES": _parse_resolution,
+    "HDO": _parse_hdmi_output,
 }
 
 

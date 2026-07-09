@@ -83,6 +83,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "SWL",
             "IFA",
             "IFV",
+            "RES",
+            "HDO",
         ))
 
     async def test_build_runtime_data_selects_tx8050_profile(self) -> None:
@@ -683,3 +685,97 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 10)
         self.assertTrue(all(v is False for v in results.values()))
         self.assertEqual(client._consecutive_failures, 2)
+
+    # ------------------------------------------------------------------
+    # Push listener tests
+    # ------------------------------------------------------------------
+
+    async def test_listener_start_creates_thread(self) -> None:
+        """Starting a listener creates a background thread."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
+        mock_device = MagicMock()
+        mock_device.get.side_effect = TimeoutError
+        client._connect = lambda: mock_device  # type: ignore[assignment]
+
+        client.start_listener(lambda msg: None)
+        try:
+            self.assertIsNotNone(client._listener_thread)
+            self.assertTrue(client._listener_thread.is_alive())
+        finally:
+            client.stop_listener()
+
+    async def test_listener_stop_joins_thread(self) -> None:
+        """Stopping a listener joins and clears the thread."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
+        mock_device = MagicMock()
+        mock_device.get.side_effect = TimeoutError
+        client._connect = lambda: mock_device  # type: ignore[assignment]
+
+        client.start_listener(lambda msg: None)
+        client.stop_listener()
+        self.assertIsNone(client._listener_thread)
+
+    async def test_listener_callback_receives_messages(self) -> None:
+        """Listener thread delivers unsolicited ISCP messages to the callback."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
+        mock_device = MagicMock()
+        mock_device.get.side_effect = ["PWR01", TimeoutError()]
+        client._connect = lambda: mock_device  # type: ignore[assignment]
+
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+
+        client.start_listener(coordinator._handle_push_message)
+        time.sleep(0.3)
+
+        try:
+            self.assertTrue(coordinator.data.power)
+        finally:
+            client.stop_listener()
+
+    async def test_push_message_updates_power(self) -> None:
+        """Direct _handle_push_message call updates power state."""
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128),
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(power=False)
+
+        coordinator._handle_push_message("PWR01")
+
+        self.assertTrue(coordinator.data.power)
+
+    async def test_push_message_updates_volume(self) -> None:
+        """Direct _handle_push_message call updates volume state."""
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128),
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(volume=0)
+
+        coordinator._handle_push_message("MVL1A")
+
+        self.assertEqual(coordinator.data.volume, 26)
+
+    async def test_disconnect_stops_listener(self) -> None:
+        """disconnect() stops the listener thread."""
+        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
+        mock_device = MagicMock()
+        mock_device.get.side_effect = TimeoutError
+        mock_device.disconnect.return_value = None
+        client._connect = lambda: mock_device  # type: ignore[assignment]
+
+        client.start_listener(lambda msg: None)
+        client.disconnect()
+        self.assertIsNone(client._listener_thread)

@@ -110,6 +110,7 @@ PROFILES: dict[str, ModelProfile] = {
         queryable_commands=(
             "LMD", "DIM", "SLA", "LTN", "RAS", "ADQ", "ADV", "MOT",
             "TGA", "TGB", "TGC", "SLP", "CTL", "SWL", "IFA", "IFV",
+            "RES", "HDO",
         ),
         supported_zones=("main", "zone2", "zone3"),
         max_volume=80,
