@@ -112,7 +112,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             name="Onkyo TX-8050",
             model="TX-8050",
             scan_interval=10,
-            sources=self.module.PROFILE_DEFAULT_SOURCES["TX-8050"],
+            sources=self.module.PROFILES["TX-8050"].default_sources,
             max_volume=80,
         )
 
@@ -587,3 +587,99 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(self.module.HomeAssistantError):
             await coordinator._async_send("MVL", "UP")
+
+    # ------------------------------------------------------------------
+    # ModelProfile and GENERIC_PROFILE tests
+    # ------------------------------------------------------------------
+
+    async def test_model_profile_prsc5507_lookup(self) -> None:
+        profile = self.module.PROFILES["PR-SC5507"]
+        self.assertEqual(profile.model, "PR-SC5507")
+        self.assertEqual(profile.default_name, "Onkyo PR-SC5507")
+        self.assertEqual(profile.max_volume, 80)
+        self.assertIn("dvd", profile.default_sources.values())
+        self.assertIn("LMD", profile.queryable_commands)
+        self.assertIn("IFA", profile.queryable_commands)
+
+    async def test_model_profile_tx8050_lookup(self) -> None:
+        profile = self.module.PROFILES["TX-8050"]
+        self.assertEqual(profile.model, "TX-8050")
+        self.assertEqual(profile.default_name, "Onkyo TX-8050")
+        self.assertEqual(profile.max_volume, 80)
+        self.assertEqual(profile.queryable_commands, ("LMD", "DIM", "SLP", "TUN"))
+        self.assertIn("dvd", profile.default_sources.values())
+
+    async def test_generic_profile_exists(self) -> None:
+        profile = self.module.GENERIC_PROFILE
+        self.assertEqual(profile.model, "GENERIC")
+        self.assertGreater(len(profile.queryable_commands), 0)
+
+    async def test_normalize_model_known(self) -> None:
+        result = self.module._normalize_model("PR-SC5507")
+        self.assertEqual(result, "PR-SC5507")
+
+    async def test_normalize_model_unknown_passthrough(self) -> None:
+        result = self.module._normalize_model("some-random-model")
+        self.assertEqual(result, "SOME-RANDOM-MODEL")
+
+    async def test_build_runtime_data_uses_generic_profile(self) -> None:
+        runtime = self.module.build_runtime_data(
+            self.hass,
+            host="192.168.1.99",
+            port=60128,
+            name="Unknown Receiver",
+            model="UNKNOWN-MODEL",
+            scan_interval=10,
+            sources={},
+            max_volume=80,
+        )
+        self.assertEqual(runtime.model, "UNKNOWN-MODEL")
+        self.assertEqual(runtime.queryable_commands, self.module.GENERIC_PROFILE.queryable_commands)
+        self.assertEqual(runtime.sources, {})
+
+    # ------------------------------------------------------------------
+    # probe_commands tests
+    # ------------------------------------------------------------------
+
+    async def test_probe_commands_marks_supported(self) -> None:
+        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
+        client._host = "test"
+        client._port = 60128
+        client._device = None
+        client._retries = 1
+        client._consecutive_failures = 0
+        client._circuit_open_until = 0.0
+        from threading import Lock
+        client._lock = Lock()
+
+        def mock_query_once(command: str) -> str:
+            if command == "PWR":
+                return "PWR01"
+            raise OSError("no response")
+
+        client._query_once = mock_query_once  # type: ignore[assignment]
+
+        results = client.probe_commands(("PWR", "XYZ"))
+        self.assertEqual(results, {"PWR": True, "XYZ": False})
+
+    async def test_probe_commands_does_not_trip_circuit_breaker(self) -> None:
+        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
+        client._host = "test"
+        client._port = 60128
+        client._device = None
+        client._retries = 1
+        client._consecutive_failures = 2
+        client._circuit_open_until = 0.0
+        from threading import Lock
+        client._lock = Lock()
+
+        def failing_query_once(command: str) -> str:
+            raise OSError("no response")
+
+        client._query_once = failing_query_once  # type: ignore[assignment]
+
+        commands = ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10")
+        results = client.probe_commands(commands)
+        self.assertEqual(len(results), 10)
+        self.assertTrue(all(v is False for v in results.values()))
+        self.assertEqual(client._consecutive_failures, 2)

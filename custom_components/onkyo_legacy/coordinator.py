@@ -19,12 +19,12 @@ from .const import (
     DEFAULT_MAX_VOLUME,
     DEFAULT_MODEL,
     DOMAIN,
+    GENERIC_PROFILE,
     MANUFACTURER,
     MODEL,
     MODEL_TX8050,
-    PROFILE_DEFAULT_SOURCES,
-    PROFILE_QUERYABLE_COMMANDS,
-    PROFILE_SUPPORTED_ZONES,
+    ModelProfile,
+    PROFILES,
 )
 
 __all__ = [
@@ -280,6 +280,22 @@ class OnkyoLegacyClient:
     def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
         """Query multiple commands in a single lock acquisition."""
         return self._with_retry(self._query_batch_once, commands)
+
+    def probe_commands(self, commands: tuple[str, ...]) -> dict[str, bool]:
+        """Probe which commands the receiver responds to.
+
+        Uses _query_once directly to bypass the circuit breaker and retry
+        logic — probe failures for unsupported commands should not count
+        toward the circuit breaker or trigger reconnect delays.
+        """
+        results: dict[str, bool] = {}
+        for command in commands:
+            try:
+                self._query_once(command)
+                results[command] = True
+            except self._RETRYABLE_ERRORS:
+                results[command] = False
+        return results
 
     def send(self, command: str, value: str) -> None:
         """Send a raw command without waiting for an acknowledgement."""
@@ -622,8 +638,9 @@ def build_runtime_data(
 ) -> OnkyoRuntimeData:
     """Build runtime data for one configured device."""
     normalized_model = _normalize_model(model)
+    profile = PROFILES.get(normalized_model, GENERIC_PROFILE)
     normalized_sources, skipped = _normalize_sources(
-        sources or PROFILE_DEFAULT_SOURCES[normalized_model],
+        sources or profile.default_sources,
         strict=strict_sources,
     )
     if skipped:
@@ -664,7 +681,7 @@ def build_runtime_data(
         max_volume=max_volume,
         coordinator=coordinator,
         device_info=device_info,
-        queryable_commands=PROFILE_QUERYABLE_COMMANDS[normalized_model],
+        queryable_commands=profile.queryable_commands,
         source_lookup=source_lookup,
         supported_listening_modes=_build_select_options("LMD"),
         supported_audio_selectors=_build_select_options("SLA") if normalized_model == MODEL else [],
@@ -674,7 +691,7 @@ def build_runtime_data(
         entity_ids=entity_ids,
     )
 
-    candidate_zone_keys = PROFILE_SUPPORTED_ZONES[normalized_model]
+    candidate_zone_keys = profile.supported_zones
     candidate_zones = tuple(
         _build_zone_runtime(
             hass=hass,
@@ -857,7 +874,7 @@ def _normalize_model(model: str) -> str:
         return MODEL
     if candidate == MODEL_TX8050:
         return MODEL_TX8050
-    raise UpdateFailed(f"Unsupported Onkyo model: {model}")
+    return candidate
 
 
 def _display_source_name(alias: str) -> str:

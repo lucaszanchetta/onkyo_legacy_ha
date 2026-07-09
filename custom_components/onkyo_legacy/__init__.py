@@ -28,10 +28,9 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_STRICT_SOURCES,
     DOMAIN,
+    GENERIC_PROFILE,
     PLATFORMS,
-    PROFILE_DEFAULT_NAMES,
-    PROFILE_DEFAULT_SOURCES,
-    PROFILE_QUERYABLE_COMMANDS,
+    PROFILES,
     SERVICE_REFRESH,
     SERVICE_SET_LISTENING_MODE,
 )
@@ -136,22 +135,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Onkyo from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     model = str(entry.data.get(CONF_MODEL, DEFAULT_MODEL)).strip().upper()
+    profile = PROFILES.get(model, GENERIC_PROFILE)
     runtime = build_runtime_data(
         hass,
         host=entry.data[CONF_HOST],
         port=entry.data[CONF_PORT],
         name=entry.data.get(CONF_NAME)
-        or PROFILE_DEFAULT_NAMES[model],
+        or profile.default_name,
         model=model,
         scan_interval=entry.data[CONF_SCAN_INTERVAL],
-        sources=entry.data.get(CONF_SOURCES) or PROFILE_DEFAULT_SOURCES[model],
+        sources=entry.data.get(CONF_SOURCES) or profile.default_sources,
         max_volume=entry.data[CONF_MAX_VOLUME],
         retries=entry.data.get(CONF_RETRIES, DEFAULT_RETRIES),
         strict_sources=entry.data.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
     )
 
-    for command in runtime.queryable_commands:
-        runtime.coordinator.set_command_capability(command, True)
+    if model in PROFILES:
+        # Known model — trust the hard-coded command list
+        for command in runtime.queryable_commands:
+            runtime.coordinator.set_command_capability(command, True)
+    else:
+        # GENERIC profile — probe which commands the receiver responds to
+        try:
+            results: dict[str, bool] = await hass.async_add_executor_job(
+                runtime.coordinator.client.probe_commands,
+                runtime.queryable_commands,
+            )
+            for command in runtime.queryable_commands:
+                supported = results.get(command, False)
+                runtime.coordinator.set_command_capability(command, supported)
+                if supported:
+                    _LOGGER.info(
+                        "Probed command %s on %s:%s: supported",
+                        command, runtime.host, runtime.port,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Probed command %s on %s:%s: not supported",
+                        command, runtime.host, runtime.port,
+                    )
+        except (OSError, TimeoutError, ConnectionError) as err:
+            _LOGGER.warning(
+                "Startup probe failed for %s:%s, using all commands as fallback: %s",
+                runtime.host, runtime.port, err,
+            )
+            for command in runtime.queryable_commands:
+                runtime.coordinator.set_command_capability(command, True)
 
     runtime.zones = await _async_detect_supported_zones(runtime)
     hass.async_create_task(_async_initial_refresh(runtime))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Final
 
 __all__ = [
@@ -29,10 +30,9 @@ __all__ = [
     "PLATFORMS",
     "DEFAULT_SOURCES",
     "TX8050_DEFAULT_SOURCES",
-    "PROFILE_DEFAULT_SOURCES",
-    "PROFILE_DEFAULT_NAMES",
-    "PROFILE_QUERYABLE_COMMANDS",
-    "PROFILE_SUPPORTED_ZONES",
+    "ModelProfile",
+    "PROFILES",
+    "GENERIC_PROFILE",
 ]
 
 DOMAIN: Final = "onkyo_legacy"
@@ -90,44 +90,51 @@ TX8050_DEFAULT_SOURCES: Final = {
     "NETWORK": "net",
 }
 
-PROFILE_DEFAULT_SOURCES: Final = {
-    MODEL: DEFAULT_SOURCES,
-    MODEL_TX8050: TX8050_DEFAULT_SOURCES,
-}
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """Frozen profile for a known Onkyo receiver model."""
 
-PROFILE_DEFAULT_NAMES: Final = {
-    MODEL: DEFAULT_NAME,
-    MODEL_TX8050: TX8050_DEFAULT_NAME,
-}
+    model: str
+    default_name: str
+    default_sources: dict[str, str]
+    queryable_commands: tuple[str, ...]
+    supported_zones: tuple[str, ...]
+    max_volume: int = 80
 
-PROFILE_QUERYABLE_COMMANDS: Final = {
-    MODEL: (
-        "LMD",
-        "DIM",
-        "SLA",
-        "LTN",
-        "RAS",
-        "ADQ",
-        "ADV",
-        "MOT",
-        "TGA",
-        "TGB",
-        "TGC",
-        "SLP",
-        "CTL",
-        "SWL",
-        "IFA",
-        "IFV",
+
+PROFILES: dict[str, ModelProfile] = {
+    MODEL: ModelProfile(
+        model=MODEL,
+        default_name=DEFAULT_NAME,
+        default_sources=DEFAULT_SOURCES,
+        queryable_commands=(
+            "LMD", "DIM", "SLA", "LTN", "RAS", "ADQ", "ADV", "MOT",
+            "TGA", "TGB", "TGC", "SLP", "CTL", "SWL", "IFA", "IFV",
+        ),
+        supported_zones=("main",),
+        max_volume=80,
     ),
-    MODEL_TX8050: (
-        "LMD",
-        "DIM",
-        "SLP",
-        "TUN",
+    MODEL_TX8050: ModelProfile(
+        model=MODEL_TX8050,
+        default_name=TX8050_DEFAULT_NAME,
+        default_sources=TX8050_DEFAULT_SOURCES,
+        queryable_commands=("LMD", "DIM", "SLP", "TUN"),
+        supported_zones=("main",),
+        max_volume=80,
     ),
 }
 
-PROFILE_SUPPORTED_ZONES: Final = {
-    MODEL: ("main",),
-    MODEL_TX8050: ("main",),
-}
+GENERIC_PROFILE = ModelProfile(
+    model="GENERIC",
+    default_name="Onkyo Receiver",
+    default_sources={},
+    queryable_commands=(
+        "PWR", "MVL", "AMT", "SLI",  # core
+        "LMD", "DIM", "SLA", "LTN", "RAS", "ADQ", "ADV", "MOT",  # main optional
+        "TGA", "TGB", "TGC", "SLP", "CTL", "SWL",  # switches/levels
+        "IFA", "IFV", "RES", "HDO",  # information
+        "TUN", "PRS",  # tuner
+    ),
+    supported_zones=("main",),
+    max_volume=80,
+)

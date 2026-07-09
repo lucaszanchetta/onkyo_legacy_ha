@@ -26,11 +26,11 @@ from .const import (
     DEFAULT_RETRIES,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_STRICT_SOURCES,
+    DOMAIN,
+    GENERIC_PROFILE,
     MODEL,
     MODEL_TX8050,
-    PROFILE_DEFAULT_NAMES,
-    PROFILE_DEFAULT_SOURCES,
-    DOMAIN,
+    PROFILES,
 )
 
 __all__ = ["OnkyoLegacyConfigFlow"]
@@ -63,6 +63,7 @@ class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             host: str = user_input[CONF_HOST]
             port: int = user_input.get(CONF_PORT, DEFAULT_PORT)
             model: str = str(user_input.get(CONF_MODEL, DEFAULT_MODEL)).strip().upper()
+            profile = PROFILES.get(model, GENERIC_PROFILE)
 
             unique_id = f"{host}:{port}"
             await self.async_set_unique_id(unique_id)
@@ -78,11 +79,11 @@ class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data = {
                     CONF_HOST: host,
                     CONF_PORT: port,
-                    CONF_NAME: PROFILE_DEFAULT_NAMES[model],
+                    CONF_NAME: profile.default_name,
                     CONF_MODEL: model,
                     CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL,
                     CONF_MAX_VOLUME: DEFAULT_MAX_VOLUME,
-                    CONF_SOURCES: PROFILE_DEFAULT_SOURCES[model],
+                    CONF_SOURCES: profile.default_sources,
                     CONF_RETRIES: DEFAULT_RETRIES,
                     CONF_STRICT_SOURCES: DEFAULT_STRICT_SOURCES,
                 }
@@ -159,6 +160,7 @@ class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_import(self, user_input):
         """Import from YAML."""
         model = str(user_input.get(CONF_MODEL, DEFAULT_MODEL)).strip().upper()
+        profile = PROFILES.get(model, GENERIC_PROFILE)
         unique_id = f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}"
         await self.async_set_unique_id(unique_id)
         self._abort_if_unique_id_configured()
@@ -166,11 +168,11 @@ class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data = {
             CONF_HOST: user_input[CONF_HOST],
             CONF_PORT: user_input.get(CONF_PORT, DEFAULT_PORT),
-            CONF_NAME: user_input.get(CONF_NAME) or PROFILE_DEFAULT_NAMES[model],
+            CONF_NAME: user_input.get(CONF_NAME) or profile.default_name,
             CONF_MODEL: model,
             CONF_SCAN_INTERVAL: user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
             CONF_MAX_VOLUME: user_input.get(CONF_MAX_VOLUME, DEFAULT_MAX_VOLUME),
-            CONF_SOURCES: user_input.get(CONF_SOURCES) or PROFILE_DEFAULT_SOURCES[model],
+            CONF_SOURCES: user_input.get(CONF_SOURCES) or profile.default_sources,
             CONF_RETRIES: user_input.get(CONF_RETRIES, DEFAULT_RETRIES),
             CONF_STRICT_SOURCES: user_input.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
         }
