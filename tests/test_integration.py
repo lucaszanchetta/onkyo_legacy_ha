@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 
 from tests.helpers import FakeHass, fresh_import
 
@@ -361,5 +362,230 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
+        self.assertEqual(result["data"]["retries"], 3)
+        self.assertFalse(result["data"]["strict_sources"])
+
+    # ── async_step_user tests ──────────────────────────────────────────
+
+    async def test_config_flow_user_shows_form(self) -> None:
+        """async_step_user returns a form with host, port, model fields."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        result = await flow.async_step_user(None)
+
+        self.assertEqual(result["type"], "show_form")
+        self.assertEqual(result["step_id"], "user")
+        self.assertIn("host", result["data_schema"].schema)
+        self.assertIn("port", result["data_schema"].schema)
+        self.assertIn("model", result["data_schema"].schema)
+
+    async def test_config_flow_user_creates_entry_on_valid_connection(self) -> None:
+        """Valid host/port/model creates a config entry."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        with patch("custom_components.onkyo_legacy.config_flow._validate_connection"):
+            result = await flow.async_step_user(
+                {
+                    "host": "192.168.1.100",
+                    "port": 60128,
+                    "model": "PR-SC5507",
+                }
+            )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["title"], "Onkyo PR-SC5507")
+        self.assertEqual(result["data"]["host"], "192.168.1.100")
+        self.assertEqual(result["data"]["port"], 60128)
+        self.assertEqual(result["data"]["model"], "PR-SC5507")
+        self.assertEqual(result["data"]["name"], "Onkyo PR-SC5507")
+        self.assertEqual(result["data"]["scan_interval"], 10)
+        self.assertEqual(result["data"]["max_volume"], 80)
+        self.assertEqual(result["data"]["retries"], 2)
+        self.assertTrue(result["data"]["strict_sources"])
+
+    async def test_config_flow_user_shows_error_on_connection_failure(self) -> None:
+        """Connection failure shows error."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        with patch(
+            "custom_components.onkyo_legacy.config_flow._validate_connection",
+            side_effect=OSError,
+        ):
+            result = await flow.async_step_user(
+                {
+                    "host": "192.168.1.100",
+                    "port": 60128,
+                    "model": "PR-SC5507",
+                }
+            )
+
+        self.assertEqual(result["type"], "show_form")
+        self.assertEqual(result["errors"]["base"], "cannot_connect")
+
+    async def test_config_flow_user_uses_tx8050_defaults(self) -> None:
+        """TX-8050 model gets correct title and sources."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        with patch("custom_components.onkyo_legacy.config_flow._validate_connection"):
+            result = await flow.async_step_user(
+                {
+                    "host": "192.168.1.100",
+                    "port": 60128,
+                    "model": "TX-8050",
+                }
+            )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["title"], "Onkyo TX-8050")
+        self.assertEqual(result["data"]["model"], "TX-8050")
+        self.assertEqual(result["data"]["name"], "Onkyo TX-8050")
+        # TX-8050 specific source
+        self.assertIn("DVD -- BD/DVD", result["data"]["sources"])
+
+    async def test_config_flow_user_aborts_on_duplicate(self) -> None:
+        """Duplicate host:port aborts with AbortFlow."""
+        from homeassistant.data_entry_flow import AbortFlow
+
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        # First call — creates entry
+        with patch("custom_components.onkyo_legacy.config_flow._validate_connection"):
+            result = await flow.async_step_user(
+                {
+                    "host": "192.168.1.100",
+                    "port": 60128,
+                    "model": "PR-SC5507",
+                }
+            )
+        self.assertEqual(result["type"], "create_entry")
+
+        # Second call with same host:port — should abort
+        with self.assertRaises(AbortFlow):
+            await flow.async_step_user(
+                {
+                    "host": "192.168.1.100",
+                    "port": 60128,
+                    "model": "PR-SC5507",
+                }
+            )
+
+    # ── async_step_reconfigure tests ──────────────────────────────────
+
+    async def test_config_flow_reconfigure_shows_form(self) -> None:
+        """Reconfigure step returns form with pre-filled host/port."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        mock_entry = self.init_module.ConfigEntry(
+            entry_id="reconfigure",
+            data={"host": "192.168.1.100", "port": 60128},
+            title="Onkyo PR-SC5507",
+        )
+
+        with patch.object(flow, "_get_reconfigure_entry", return_value=mock_entry):
+            result = await flow.async_step_reconfigure(None)
+
+        self.assertEqual(result["type"], "show_form")
+        self.assertEqual(result["step_id"], "reconfigure")
+        self.assertIn("host", result["data_schema"].schema)
+        self.assertIn("port", result["data_schema"].schema)
+
+    async def test_config_flow_reconfigure_updates_on_valid_connection(self) -> None:
+        """Reconfigure with valid host/port updates the entry data."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        mock_entry = self.init_module.ConfigEntry(
+            entry_id="reconfigure",
+            data={"host": "192.168.1.100", "port": 60128},
+            title="Onkyo PR-SC5507",
+        )
+
+        with patch.object(flow, "_get_reconfigure_entry", return_value=mock_entry):
+            with patch("custom_components.onkyo_legacy.config_flow._validate_connection"):
+                result = await flow.async_step_reconfigure(
+                    {
+                        "host": "192.168.1.200",
+                        "port": 60129,
+                    }
+                )
+
+        self.assertEqual(result["type"], "update_entry")
+        self.assertEqual(mock_entry.data["host"], "192.168.1.200")
+        self.assertEqual(mock_entry.data["port"], 60129)
+
+    async def test_config_flow_reconfigure_shows_error_on_failure(self) -> None:
+        """Reconfigure with unreachable host shows error."""
+        flow = self.config_flow_module.OnkyoLegacyConfigFlow()
+        flow.hass = self.hass
+
+        mock_entry = self.init_module.ConfigEntry(
+            entry_id="reconfigure",
+            data={"host": "192.168.1.100", "port": 60128},
+            title="Onkyo PR-SC5507",
+        )
+
+        with patch.object(flow, "_get_reconfigure_entry", return_value=mock_entry):
+            with patch(
+                "custom_components.onkyo_legacy.config_flow._validate_connection",
+                side_effect=OSError,
+            ):
+                result = await flow.async_step_reconfigure(
+                    {
+                        "host": "192.168.1.200",
+                        "port": 60129,
+                    }
+                )
+
+        self.assertEqual(result["type"], "show_form")
+        self.assertEqual(result["errors"]["base"], "cannot_connect")
+
+    # ── Options flow tests ────────────────────────────────────────────
+
+    async def test_options_flow_shows_form(self) -> None:
+        """Options flow returns form with scan_interval, max_volume, retries, strict_sources."""
+        entry = self.init_module.ConfigEntry(
+            entry_id="test",
+            data={},
+            title="Onkyo Test",
+            options={"scan_interval": 5},
+        )
+        handler = self.config_flow_module.OnkyoLegacyOptionsFlowHandler(entry)
+
+        result = await handler.async_step_init(None)
+
+        self.assertEqual(result["type"], "show_form")
+        self.assertEqual(result["step_id"], "init")
+        self.assertIn("scan_interval", result["data_schema"].schema)
+        self.assertIn("max_volume", result["data_schema"].schema)
+        self.assertIn("retries", result["data_schema"].schema)
+        self.assertIn("strict_sources", result["data_schema"].schema)
+
+    async def test_options_flow_creates_entry(self) -> None:
+        """Options flow with valid input creates entry."""
+        entry = self.init_module.ConfigEntry(
+            entry_id="test",
+            data={},
+            title="Onkyo Test",
+        )
+        handler = self.config_flow_module.OnkyoLegacyOptionsFlowHandler(entry)
+
+        result = await handler.async_step_init(
+            {
+                "scan_interval": 15,
+                "max_volume": 90,
+                "retries": 3,
+                "strict_sources": False,
+            }
+        )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["data"]["scan_interval"], 15)
+        self.assertEqual(result["data"]["max_volume"], 90)
         self.assertEqual(result["data"]["retries"], 3)
         self.assertFalse(result["data"]["strict_sources"])

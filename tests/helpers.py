@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntFlag
 import importlib
 from pathlib import Path
@@ -112,6 +112,17 @@ def install_stubs() -> None:
     core.HomeAssistant = HomeAssistant
     sys.modules["homeassistant.core"] = core
 
+    data_entry_flow = types.ModuleType("homeassistant.data_entry_flow")
+
+    class AbortFlow(Exception):
+        def __init__(self, reason: str = "") -> None:
+            super().__init__(reason)
+            self.reason = reason
+
+    data_entry_flow.FlowResult = dict
+    data_entry_flow.AbortFlow = AbortFlow
+    sys.modules["homeassistant.data_entry_flow"] = data_entry_flow
+
     config_entries = types.ModuleType("homeassistant.config_entries")
 
     @dataclass
@@ -119,23 +130,124 @@ def install_stubs() -> None:
         entry_id: str
         data: dict[str, Any]
         title: str = ""
+        options: dict[str, Any] = field(default_factory=dict)
+        unique_id: str | None = None
+
+    class OptionsFlow:
+        def __init__(self, config_entry: ConfigEntry | None = None) -> None:
+            self.config_entry = config_entry
+
+        def async_show_form(
+            self,
+            *,
+            step_id: str,
+            data_schema: Any = None,
+            errors: dict[str, str] | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "type": "show_form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors or {},
+            }
+
+        def async_create_entry(
+            self, *, data: dict[str, Any], title: str | None = None
+        ) -> dict[str, Any]:
+            return {"type": "create_entry", "data": data, "title": title}
+
+        def add_suggested_values_to_schema(
+            self, schema: Any, suggested_values: dict[str, Any]
+        ) -> Any:
+            return schema
 
     class ConfigFlow:
         def __init_subclass__(cls, domain: str | None = None, **kwargs: Any) -> None:
             super().__init_subclass__(**kwargs)
             cls.DOMAIN = domain
 
+        def __init__(self) -> None:
+            self.unique_id: str | None = None
+
         async def async_set_unique_id(self, unique_id: str) -> None:
             self.unique_id = unique_id
 
         def _abort_if_unique_id_configured(self) -> None:
-            return None
+            if self.unique_id is None:
+                return
+            if not hasattr(self, "hass") or self.hass is None:
+                return
+            for entry in self._async_current_entries():
+                if getattr(entry, "unique_id", None) == self.unique_id:
+                    raise AbortFlow("already_configured")
+
+        def _async_current_entries(self) -> list[ConfigEntry]:
+            if not hasattr(self, "hass") or self.hass is None:
+                return []
+            return self.hass.config_entries.async_entries(self.DOMAIN)
 
         def async_create_entry(self, *, title: str, data: dict[str, Any]) -> dict[str, Any]:
+            if hasattr(self, "hass") and self.hass is not None:
+                entry = ConfigEntry(
+                    entry_id=f"flow-{title}-{id(self)}",
+                    data=data,
+                    title=title,
+                    unique_id=getattr(self, "unique_id", None),
+                )
+                self.hass.config_entries._entries.append(entry)
             return {"type": "create_entry", "title": title, "data": data}
+
+        def async_show_form(
+            self,
+            *,
+            step_id: str,
+            data_schema: Any = None,
+            errors: dict[str, str] | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "type": "show_form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors or {},
+            }
+
+        def _get_reconfigure_entry(self) -> ConfigEntry:
+            return ConfigEntry(
+                entry_id="reconfigure",
+                data={},
+                title="",
+            )
+
+        def async_update_reload_and_abort(
+            self, entry: ConfigEntry, *, data_updates: dict[str, Any]
+        ) -> dict[str, Any]:
+            entry.data.update(data_updates)
+            return {"type": "update_entry", "data": entry.data, "result": None}
+
+        def add_suggested_values_to_schema(
+            self, schema: Any, suggested_values: dict[str, Any]
+        ) -> Any:
+            return schema
+
+        async def async_step_user(
+            self, user_input: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+            return {"type": "show_form", "step_id": "user"}
+
+        async def async_step_reconfigure(
+            self, user_input: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+            return {"type": "show_form", "step_id": "reconfigure"}
+
+        @staticmethod
+        def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+            return OptionsFlow(config_entry)
 
     config_entries.ConfigEntry = ConfigEntry
     config_entries.ConfigFlow = ConfigFlow
+    config_entries.OptionsFlow = OptionsFlow
     sys.modules["homeassistant.config_entries"] = config_entries
 
     helpers_pkg = types.ModuleType("homeassistant.helpers")
@@ -401,9 +513,13 @@ class FakeConfigEntries:
         self.flow = types.SimpleNamespace(async_init=self._async_init)
         self.init_calls: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         self.forward_calls: list[tuple[str, tuple[str, ...]]] = []
+        self._entries: list[ConfigEntry] = []
 
     async def _async_init(self, domain: str, context: dict[str, Any], data: dict[str, Any]) -> None:
         self.init_calls.append((domain, context, data))
+
+    def async_entries(self, domain: str) -> list[ConfigEntry]:
+        return self._entries
 
     async def async_forward_entry_setups(self, entry: Any, platforms: tuple[str, ...]) -> None:
         self.forward_calls.append((entry.entry_id, platforms))

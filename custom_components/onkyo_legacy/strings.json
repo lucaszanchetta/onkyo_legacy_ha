@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Onkyo Legacy Receiver",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "model": "Model"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Onkyo Legacy Receiver",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the receiver. Check the host and port."
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "reconfigure_successful": "Reconfiguration successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Onkyo Legacy Options",
+        "data": {
+          "scan_interval": "Polling interval (seconds)",
+          "max_volume": "Maximum volume",
+          "retries": "Command retries",
+          "strict_sources": "Strict source mode"
+        }
+      }
+    }
+  }
+}
