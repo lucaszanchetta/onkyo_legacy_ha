@@ -121,6 +121,7 @@ class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
     """Represent a parsed audio/video diagnostic sensor."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
@@ -133,6 +134,7 @@ class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
         self.entity_description = description
         self._attr_name = description.name
         self._attr_unique_id = f"{runtime.host}-{description.key}"
+        self._attr_translation_key = description.key
         self._attr_device_info = runtime.device_info
         self._attr_icon = description.icon
 
@@ -155,8 +157,10 @@ class OnkyoLegacyTunerSensor(CoordinatorEntity, SensorEntity):
     """Represent the current tuner frequency."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Tuner Frequency"
+    _attr_translation_key = "tuner_frequency"
     _attr_icon = "mdi:radio"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:

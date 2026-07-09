@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -63,6 +64,7 @@ class OnkyoLegacyNumber(CoordinatorEntity, NumberEntity):
         self._description = description
         self._attr_name = description.name
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-{description.key}"
+        self._attr_translation_key = description.key
         self._attr_native_min_value = description.native_min_value
         self._attr_native_max_value = description.native_max_value
         self._attr_native_step = description.native_step
@@ -101,7 +103,9 @@ class OnkyoLegacyVolumeNumber(CoordinatorEntity, NumberEntity):
     """Represent the main volume as a separate number entity."""
 
     _attr_has_entity_name = True
-    _attr_name = "Volume Level"
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "volume_level"
     _attr_mode = NumberMode.BOX
     _attr_icon = "mdi:volume-high"
 

@@ -289,6 +289,7 @@ def install_stubs() -> None:
     entity = types.ModuleType("homeassistant.helpers.entity")
 
     class EntityCategory(Enum):
+        CONFIG = "config"
         DIAGNOSTIC = "diagnostic"
 
     entity.EntityCategory = EntityCategory

@@ -37,5 +37,45 @@
         }
       }
     }
+  },
+  "entity": {
+    "switch": {
+      "power": { "name": "Power" },
+      "mute": { "name": "Mute" },
+      "cinema_filter": { "name": "Cinema Filter" },
+      "audyssey_dynamic_eq": { "name": "Audyssey Dynamic EQ" },
+      "music_optimizer": { "name": "Music Optimizer" },
+      "trigger_a": { "name": "12V Trigger A" },
+      "trigger_b": { "name": "12V Trigger B" },
+      "trigger_c": { "name": "12V Trigger C" }
+    },
+    "number": {
+      "volume_level": { "name": "Volume" },
+      "sleep-timer": { "name": "Sleep Timer" },
+      "center-level": { "name": "Center Level" },
+      "subwoofer-level": { "name": "Subwoofer Level" }
+    },
+    "select": {
+      "source": { "name": "Source" },
+      "listening_mode": { "name": "Listening Mode" },
+      "dimmer_level": { "name": "Dimmer Level" },
+      "audio_selector": { "name": "Audio Selector" },
+      "late_night": { "name": "Late Night" },
+      "audyssey_dynamic_volume": { "name": "Audyssey Dynamic Volume" }
+    },
+    "sensor": {
+      "audio_input_terminal": { "name": "Audio Input Terminal" },
+      "audio_input_signal": { "name": "Audio Input Signal" },
+      "audio_sampling_frequency": { "name": "Audio Sampling Frequency" },
+      "audio_input_channels": { "name": "Audio Input Channels" },
+      "audio_listening_mode": { "name": "Audio Listening Mode" },
+      "video_input": { "name": "Video Input" },
+      "video_input_resolution": { "name": "Video Input Resolution" },
+      "video_output": { "name": "Video Output" },
+      "video_output_resolution": { "name": "Video Output Resolution" },
+      "video_picture_mode": { "name": "Video Picture Mode" },
+      "tuner_frequency": { "name": "Tuner Frequency" }
+    },
+    "media_player": {}
   }
 }

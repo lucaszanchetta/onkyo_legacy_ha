@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -50,6 +51,8 @@ class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
     """Represent a query-backed Onkyo binary control."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
         self,
@@ -64,6 +67,7 @@ class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
         self._command = command
         self._state_attr = state_attr
         self._attr_name = name if runtime.zone_key == "main" else f"{runtime.zone_label} {name}"
+        self._attr_translation_key = key
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-{key}"
         self._attr_device_info = runtime.device_info
         self._attr_icon = {
@@ -106,7 +110,9 @@ class OnkyoLegacyPowerSwitch(CoordinatorEntity, SwitchEntity):
     """Represent the receiver power as a separate switch."""
 
     _attr_has_entity_name = True
-    _attr_name = "Power"
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "power"
     _attr_icon = "mdi:power"
 
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
@@ -139,7 +145,9 @@ class OnkyoLegacyMuteSwitch(CoordinatorEntity, SwitchEntity):
     """Represent audio mute as a separate switch."""
 
     _attr_has_entity_name = True
-    _attr_name = "Mute"
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "mute"
     _attr_icon = "mdi:volume-mute"
 
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:

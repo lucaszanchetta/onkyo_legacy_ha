@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -44,6 +45,9 @@ class OnkyoLegacySourceSelect(CoordinatorEntity, SelectEntity):
     """Represent a source select."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "source"
     _attr_icon = "mdi:source-branch"
 
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
@@ -88,6 +92,7 @@ class OnkyoLegacyListeningModeSelect(CoordinatorEntity, SelectEntity):
 
     _attr_has_entity_name = True
     _attr_name = "Listening Mode"
+    _attr_translation_key = "listening_mode"
     _attr_icon = "mdi:surround-sound"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
@@ -124,7 +129,10 @@ class OnkyoLegacyDimmerSelect(CoordinatorEntity, SelectEntity):
     """Represent a dimmer-level select."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Dimmer Level"
+    _attr_translation_key = "dimmer_level"
     _attr_icon = "mdi:brightness-6"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
@@ -154,7 +162,10 @@ class OnkyoLegacyAudioSelectorSelect(CoordinatorEntity, SelectEntity):
     """Represent an audio-selector select."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Audio Selector"
+    _attr_translation_key = "audio_selector"
     _attr_icon = "mdi:audio-input-rca"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
@@ -184,7 +195,10 @@ class OnkyoLegacyLateNightSelect(CoordinatorEntity, SelectEntity):
     """Represent a late-night mode select."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Late Night"
+    _attr_translation_key = "late_night"
     _attr_icon = "mdi:weather-night"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
@@ -214,7 +228,10 @@ class OnkyoLegacyAudysseyDynamicVolumeSelect(CoordinatorEntity, SelectEntity):
     """Represent an Audyssey Dynamic Volume select."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Audyssey Dynamic Volume"
+    _attr_translation_key = "audyssey_dynamic_volume"
     _attr_icon = "mdi:volume-high"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
