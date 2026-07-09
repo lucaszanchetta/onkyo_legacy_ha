@@ -33,6 +33,9 @@ from .const import (
     PROFILES,
     SERVICE_REFRESH,
     SERVICE_SET_LISTENING_MODE,
+    SERVICE_SET_SOURCE,
+    SERVICE_SET_VOLUME,
+    SERVICE_SET_DIMMER,
 )
 from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, ZONE_DEFINITIONS, build_runtime_data
 
@@ -290,6 +293,59 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         ),
     )
 
+    async def async_handle_set_source(call: ServiceCall) -> None:
+        zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
+        source = call.data["source"]
+        if source not in zone_runtime.sources:
+            raise vol.Invalid(
+                f"Unknown source: {source}. "
+                f"Available: {', '.join(sorted(zone_runtime.sources))}"
+            )
+        await zone_runtime.coordinator.async_select_source(zone_runtime.sources[source])
+
+    async def async_handle_set_volume(call: ServiceCall) -> None:
+        volume = call.data["volume"]
+        zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
+        raw = format(volume, "02X")
+        await zone_runtime.coordinator.client.send(
+            zone_runtime.zone.volume_command, raw
+        )
+        await zone_runtime.coordinator.async_request_refresh()
+
+    async def async_handle_set_dimmer(call: ServiceCall) -> None:
+        runtime = _resolve_runtime(hass, call.data.get(CONF_ENTITY_ID))
+        level = call.data["level"]
+        await runtime.coordinator.client.send("DIM", level)
+        await runtime.coordinator.async_request_refresh()
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_SOURCE,
+        async_handle_set_source,
+        schema=vol.Schema({
+            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+            vol.Required("source"): cv.string,
+        }),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_VOLUME,
+        async_handle_set_volume,
+        schema=vol.Schema({
+            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+            vol.Required("volume"): vol.All(vol.Coerce(int), vol.Range(min=0, max=200)),
+        }),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_DIMMER,
+        async_handle_set_dimmer,
+        schema=vol.Schema({
+            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+            vol.Required("level"): cv.string,
+        }),
+    )
+
 
 def _resolve_runtime(hass: HomeAssistant, entity_id: str | None) -> OnkyoRuntimeData:
     runtimes: dict[str, OnkyoRuntimeData] = hass.data[DOMAIN]
@@ -303,6 +359,29 @@ def _resolve_runtime(hass: HomeAssistant, entity_id: str | None) -> OnkyoRuntime
         return next(iter(runtimes.values()))
 
     raise vol.Invalid("entity_id is required when multiple Onkyo Legacy devices are configured")
+
+
+def _resolve_zone_runtime(
+    hass: HomeAssistant, entity_id: str | None
+) -> OnkyoRuntimeData | OnkyoZoneRuntimeData:
+    """Resolve the zone runtime for a given entity_id.
+
+    Returns the main zone runtime if no entity_id is given or if the zone
+    cannot be determined from the entity registry.
+    """
+    runtime = _resolve_runtime(hass, entity_id)
+    if not entity_id:
+        return runtime.zones[0]
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
+    entry = registry.async_get(entity_id)
+    if entry is not None:
+        for zone_runtime in runtime.zones:
+            prefix = f"{runtime.host}-{zone_runtime.zone_key}"
+            if entry.unique_id.startswith(prefix):
+                return zone_runtime
+    return runtime.zones[0]
 
 
 def _disconnect_all(hass: HomeAssistant) -> None:

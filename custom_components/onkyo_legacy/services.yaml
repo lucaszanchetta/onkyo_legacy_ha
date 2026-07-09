@@ -22,3 +22,52 @@ set_listening_mode:
       example: stereo
       selector:
         text:
+
+set_source:
+  name: Set source
+  description: Set the input source for a specific zone entity.
+  fields:
+    entity_id:
+      required: false
+      selector:
+        entity:
+          integration: onkyo_legacy
+    source:
+      required: true
+      example: TV
+      selector:
+        text:
+
+set_volume:
+  name: Set volume
+  description: Set the absolute volume level for a specific zone entity.
+  fields:
+    entity_id:
+      required: false
+      selector:
+        entity:
+          integration: onkyo_legacy
+    volume:
+      required: true
+      example: 26
+      selector:
+        number:
+          min: 0
+          max: 200
+          step: 1
+          unit_of_measurement: dB
+
+set_dimmer:
+  name: Set dimmer
+  description: Set the dimmer level on the processor.
+  fields:
+    entity_id:
+      required: false
+      selector:
+        entity:
+          integration: onkyo_legacy
+    level:
+      required: true
+      example: "01"
+      selector:
+        text:

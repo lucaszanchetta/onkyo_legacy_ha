@@ -26,6 +26,9 @@ __all__ = [
     "DEFAULT_STRICT_SOURCES",
     "SERVICE_REFRESH",
     "SERVICE_SET_LISTENING_MODE",
+    "SERVICE_SET_SOURCE",
+    "SERVICE_SET_VOLUME",
+    "SERVICE_SET_DIMMER",
     "ATTR_LISTENING_MODE",
     "PLATFORMS",
     "DEFAULT_SOURCES",
@@ -60,6 +63,9 @@ DEFAULT_STRICT_SOURCES: Final = True
 
 SERVICE_REFRESH: Final = "refresh"
 SERVICE_SET_LISTENING_MODE: Final = "set_listening_mode"
+SERVICE_SET_SOURCE: Final = "set_source"
+SERVICE_SET_VOLUME: Final = "set_volume"
+SERVICE_SET_DIMMER: Final = "set_dimmer"
 ATTR_LISTENING_MODE: Final = "listening_mode"
 
 PLATFORMS: Final = ("media_player", "number", "select", "switch", "sensor")
