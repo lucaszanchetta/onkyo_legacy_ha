@@ -65,7 +65,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("query", runtime.supported_listening_modes)
         self.assertEqual(runtime.supported_dimmer_modes, ["bright", "dim", "dark"])
         self.assertEqual(tuple(zone.zone_key for zone in runtime.zones), ("main",))
-        self.assertEqual(tuple(zone.zone_key for zone in runtime.candidate_zones), ())
+        self.assertEqual(tuple(zone.zone_key for zone in runtime.candidate_zones), ("zone2", "zone3"))
         self.assertEqual(runtime.queryable_commands, (
             "LMD",
             "DIM",
@@ -180,7 +180,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(runtime.sources, {"OPTICAL": "optical", "DVD -- BD/DVD": "dvd", "TV": "tv"})
-        self.assertEqual(runtime.candidate_zones, ())
+        self.assertEqual(tuple(z.zone_key for z in runtime.candidate_zones), ("zone2", "zone3"))
 
     async def test_update_data_parses_prsc5507_queryable_state(self) -> None:
         client = FakeClient(

@@ -34,7 +34,7 @@ from .const import (
     SERVICE_REFRESH,
     SERVICE_SET_LISTENING_MODE,
 )
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, build_runtime_data
+from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, ZONE_DEFINITIONS, build_runtime_data
 
 __all__ = ["async_setup", "async_setup_entry", "async_unload_entry"]
 
@@ -73,6 +73,7 @@ ZONE_ENTITY_UNIQUE_ID_SUFFIXES: dict[str, tuple[tuple[str, str], ...]] = {
         ("media_player", "zone2"),
         ("number", "zone2-volume-level"),
         ("select", "zone2-source"),
+        ("select", "zone2-listening-mode"),
         ("switch", "zone2-power"),
         ("switch", "zone2-mute"),
     ),
@@ -80,6 +81,7 @@ ZONE_ENTITY_UNIQUE_ID_SUFFIXES: dict[str, tuple[tuple[str, str], ...]] = {
         ("media_player", "zone3"),
         ("number", "zone3-volume-level"),
         ("select", "zone3-source"),
+        ("select", "zone3-listening-mode"),
         ("switch", "zone3-power"),
         ("switch", "zone3-mute"),
     ),
@@ -183,6 +185,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 runtime.coordinator.set_command_capability(command, True)
 
     runtime.zones = await _async_detect_supported_zones(runtime)
+    _propagate_zone_command_capabilities(runtime)
     hass.async_create_task(_async_initial_refresh(runtime))
 
     hass.data[DOMAIN][entry.entry_id] = runtime
@@ -227,6 +230,19 @@ async def _async_detect_supported_zones(
             continue
         zones.append(zone_runtime)
     return tuple(zones)
+
+
+def _propagate_zone_command_capabilities(runtime: OnkyoRuntimeData) -> None:
+    """Propagate relevant command capabilities from main to zone coordinators."""
+    for zone_runtime in runtime.zones:
+        if zone_runtime.zone_key == "main":
+            continue
+        zone_def = ZONE_DEFINITIONS.get(zone_runtime.zone_key)
+        if zone_def is None:
+            continue
+        for command in zone_def.optional_commands:
+            if runtime.coordinator.supports(command):
+                zone_runtime.coordinator.set_command_capability(command, True)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

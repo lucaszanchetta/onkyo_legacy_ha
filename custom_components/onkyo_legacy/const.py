@@ -111,7 +111,7 @@ PROFILES: dict[str, ModelProfile] = {
             "LMD", "DIM", "SLA", "LTN", "RAS", "ADQ", "ADV", "MOT",
             "TGA", "TGB", "TGC", "SLP", "CTL", "SWL", "IFA", "IFV",
         ),
-        supported_zones=("main",),
+        supported_zones=("main", "zone2", "zone3"),
         max_volume=80,
     ),
     MODEL_TX8050: ModelProfile(

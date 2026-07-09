@@ -213,12 +213,13 @@ class ZoneDefinition:
     volume_command: str
     mute_command: str
     source_command: str
+    optional_commands: tuple[str, ...] = ()
 
 
 ZONE_DEFINITIONS: dict[str, ZoneDefinition] = {
     "main": ZoneDefinition("main", "Main", "main", "PWR", "MVL", "AMT", "SLI"),
-    "zone2": ZoneDefinition("zone2", "Zone 2", "zone2", "ZPW", "ZVL", "ZMT", "SLZ"),
-    "zone3": ZoneDefinition("zone3", "Zone 3", "zone3", "PW3", "VL3", "MT3", "SL3"),
+    "zone2": ZoneDefinition("zone2", "Zone 2", "zone2", "ZPW", "ZVL", "ZMT", "SLZ", optional_commands=("LMD",)),
+    "zone3": ZoneDefinition("zone3", "Zone 3", "zone3", "PW3", "VL3", "MT3", "SL3", optional_commands=("LMD",)),
 }
 
 
@@ -466,6 +467,13 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             source=_parse_enum(results[self.zone.source_command], self.source_raw_to_name),
         )
         if self.zone.key != "main":
+            for command, value_map in _OPTIONAL_MODE_COMMANDS:
+                if command in self.zone.optional_commands and self.supports(command):
+                    raw = results.get(command)
+                    if raw is not None:
+                        setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME))
+            if state.listening_mode is None:
+                state.listening_mode = (self.data or OnkyoState()).listening_mode
             return state
 
         previous = self.data or OnkyoState()
@@ -522,6 +530,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         """Return the set of optional ISCP commands to query for this zone."""
         commands: set[str] = set()
         if self.zone.key != "main":
+            for command in self.zone.optional_commands:
+                if self.supports(command):
+                    commands.add(command)
             return commands
         for command, _ in _OPTIONAL_MODE_COMMANDS:
             if self.supports(command):

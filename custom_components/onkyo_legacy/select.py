@@ -26,6 +26,10 @@ async def async_setup_entry(
     for zone_runtime in runtime.zones:
         if zone_runtime.sources:
             entities.append(OnkyoLegacySourceSelect(zone_runtime))
+        if zone_runtime.zone_key != "main" and zone_runtime.coordinator.supports("LMD"):
+            entities.append(
+                OnkyoLegacyListeningModeSelect(zone_runtime, supported_modes=runtime.supported_listening_modes)
+            )
     if runtime.coordinator.supports("LMD"):
         entities.append(OnkyoLegacyListeningModeSelect(runtime))
     if runtime.coordinator.supports("DIM"):
@@ -95,9 +99,14 @@ class OnkyoLegacyListeningModeSelect(CoordinatorEntity, SelectEntity):
     _attr_translation_key = "listening_mode"
     _attr_icon = "mdi:surround-sound"
 
-    def __init__(self, runtime: OnkyoRuntimeData) -> None:
+    def __init__(
+        self,
+        runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData,
+        supported_modes: list[str] | None = None,
+    ) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
+        self._supported_modes = supported_modes
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-listening-mode"
         self._attr_device_info = runtime.device_info
 
@@ -112,10 +121,13 @@ class OnkyoLegacyListeningModeSelect(CoordinatorEntity, SelectEntity):
     @property
     def options(self) -> list[str]:
         current = self.current_option
-        options = list(self._runtime.supported_listening_modes)
-        if current and current not in options:
-            options.append(current)
-        return options
+        if self._supported_modes is not None:
+            base = list(self._supported_modes)
+        else:
+            base = list(self._runtime.supported_listening_modes)  # type: ignore[union-attr]
+        if current and current not in base:
+            base.append(current)
+        return base
 
     @property
     def available(self) -> bool:

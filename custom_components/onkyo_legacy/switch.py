@@ -34,14 +34,15 @@ async def async_setup_entry(
     """Set up switch entities from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[CoordinatorEntity] = [
-        OnkyoLegacyPowerSwitch(runtime),
-        OnkyoLegacyMuteSwitch(runtime),
-    ] + [
+    entities: list[CoordinatorEntity] = []
+    for zone_runtime in runtime.zones:
+        entities.append(OnkyoLegacyPowerSwitch(zone_runtime))
+        entities.append(OnkyoLegacyMuteSwitch(zone_runtime))
+    entities.extend(
         OnkyoLegacySpeakerSwitch(runtime, key, name, command, state_attr)
         for key, name, command, state_attr in DESCRIPTIONS
         if runtime.coordinator.supports(command)
-    ]
+    )
 
     if entities:
         async_add_entities(entities)
