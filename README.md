@@ -15,13 +15,48 @@ Custom Home Assistant integration for legacy Onkyo receivers (PR-SC5507, TX-8050
 - **Diagnostics** — built-in diagnostics for bug reports (config, state, circuit breaker status)
 - **5 services** — `refresh`, `set_listening_mode`, `set_source`, `set_volume`, `set_dimmer`
 
-## Supported Models
+## Compatibility
 
-| Model | Profile | Zones | Notes |
-|-------|---------|-------|-------|
-| PR-SC5507 | Built-in | Main, Zone 2, Zone 3 | Full feature set — audio/video diagnostics, tuner, all optional controls |
-| TX-8050 | Built-in | Main | Audio-only — tuner, dimmer, sleep timer |
-| Any other | GENERIC | Main | Probes all known ISCP commands at startup; enables only supported ones |
+This integration works with any receiver that supports **eISCP over TCP port 60128**. This includes:
+
+- **Onkyo** networked AV receivers, stereo receivers, and pre/pros (2011+)
+- **Integra** custom install receivers and processors (2011+)
+- **Pioneer** networked AV receivers (2016+)
+
+### Requirements
+
+- Ethernet or Wi-Fi connection to the receiver
+- **Network Control** enabled on the receiver (`Setup → Hardware → Network → Network Control`)
+- The receiver must be reachable on TCP port 60128
+
+### Tested Models
+
+| Model | Type | Zones | Profile |
+|-------|------|-------|---------|
+| PR-SC5507 | AV Processor | Main, Zone 2, Zone 3 | Built-in (22/30 commands queryable) |
+| TX-8050 | Stereo Receiver | Main, Zone 2 | Built-in (11/12 commands queryable) |
+
+### Generic Model Support
+
+Any unlisted eISCP receiver uses the **GENERIC** profile, which probes all known ISCP commands at startup and enables only the ones the receiver responds to. This means:
+
+- Core controls (power, volume, mute, source) work on virtually all eISCP receivers
+- Optional controls (listening mode, dimmer, sleep timer, etc.) are auto-detected
+- Zone 2/3 support is detected at startup
+- No manual configuration needed — just enter the IP address
+
+To check what your receiver supports before installing, use the included smoke test tool:
+
+```bash
+./.venv/bin/python scripts/prsc5507_smoke.py --host 192.168.1.23 --model YOUR_MODEL --discover
+```
+
+### Known Limitations
+
+- Volume resolution varies by model era: older models use 0–80, newer models use 0–200
+- Some commands may time out on certain models (these are automatically disabled)
+- Zone 2/3 volume control may not work on all models (e.g., TX-8050 Zone 2 volume returns N/A)
+- Network Control must be enabled — without it, the receiver only accepts connections when powered on
 
 ## Install
 
