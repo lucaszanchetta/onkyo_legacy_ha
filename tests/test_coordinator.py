@@ -638,6 +638,9 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.model, "UNKNOWN-MODEL")
         self.assertEqual(runtime.queryable_commands, self.module.GENERIC_PROFILE.queryable_commands)
         self.assertEqual(runtime.sources, {})
+        self.assertIn("auto", runtime.supported_audio_selectors)
+        self.assertIn("off", runtime.supported_late_night_modes)
+        self.assertIn("medium", runtime.supported_audyssey_volume_modes)
 
     # ------------------------------------------------------------------
     # probe_commands tests
@@ -767,6 +770,63 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator._handle_push_message("MVL1A")
 
         self.assertEqual(coordinator.data.volume, 26)
+
+    async def test_push_message_updates_mute(self) -> None:
+        """Direct _handle_push_message call updates mute state."""
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128),
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(muted=False)
+
+        coordinator._handle_push_message("AMT01")
+
+        self.assertTrue(coordinator.data.muted)
+
+    async def test_push_message_updates_source(self) -> None:
+        """Direct _handle_push_message call updates source state."""
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128),
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(source=None)
+
+        coordinator._handle_push_message("SLI02")
+
+        self.assertEqual(coordinator.data.source, "video3")
+
+    async def test_optional_state_dict_preserves_optional_fields(self) -> None:
+        """Partial push updates preserve previously-set optional fields."""
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128),
+            host="127.0.0.1",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(
+            power=True,
+            volume=30,
+            muted=False,
+            source="dvd",
+            listening_mode="ALL CH STEREO",
+            dimmer_level="dim",
+            audio_selector="auto",
+        )
+
+        # Send a volume push that only updates one core field
+        coordinator._handle_push_message("MVL1A")
+
+        self.assertEqual(coordinator.data.volume, 26)
+        self.assertEqual(coordinator.data.listening_mode, "ALL CH STEREO")
+        self.assertEqual(coordinator.data.dimmer_level, "dim")
+        self.assertEqual(coordinator.data.audio_selector, "auto")
 
     async def test_disconnect_stops_listener(self) -> None:
         """disconnect() stops the listener thread."""

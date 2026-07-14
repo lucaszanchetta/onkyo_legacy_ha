@@ -74,6 +74,8 @@
       "video_output": { "name": "Video Output" },
       "video_output_resolution": { "name": "Video Output Resolution" },
       "video_picture_mode": { "name": "Video Picture Mode" },
+      "video_resolution": { "name": "Video Resolution" },
+      "hdmi_output": { "name": "HDMI Output" },
       "tuner_frequency": { "name": "Tuner Frequency" }
     },
     "media_player": {}

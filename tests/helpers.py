@@ -11,6 +11,12 @@ import sys
 import types
 from typing import Any, Callable
 
+# Type-only alias so static analysis tools can resolve `ConfigEntry` references
+# in stub type annotations. The real Home Assistant ConfigEntry type is not
+# available in the test environment; the alias is sufficient for `list[ConfigEntry]`
+# style annotations used throughout this stub module.
+ConfigEntry = object
+
 
 def install_stubs() -> None:
     """Install lightweight stubs for Home Assistant and voluptuous."""
@@ -408,6 +414,14 @@ def install_stubs() -> None:
 
     components = types.ModuleType("homeassistant.components")
     sys.modules["homeassistant.components"] = components
+
+    diagnostics = types.ModuleType("homeassistant.components.diagnostics")
+
+    def async_redact_data(data: dict, to_redact: set) -> dict:
+        return {k: ("**REDACTED**" if k in to_redact else v) for k, v in data.items()}
+
+    diagnostics.async_redact_data = async_redact_data
+    sys.modules["homeassistant.components.diagnostics"] = diagnostics
 
     media_player = types.ModuleType("homeassistant.components.media_player")
 

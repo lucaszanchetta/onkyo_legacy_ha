@@ -7,16 +7,30 @@ from unittest.mock import patch
 from tests.helpers import FakeHass, fresh_import
 
 
+class FakeClient:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, command: str, value: str) -> None:
+        self.sent.append((command, value))
+
+    def disconnect(self) -> None:
+        pass
+
+
 class FakeCoordinator:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
-        self.client = type("Client", (), {"disconnect": lambda self: None})()
+        self.client = FakeClient()
 
     async def async_request_refresh(self) -> None:
         self.calls.append(("refresh", ""))
 
     async def async_set_listening_mode(self, mode: str) -> None:
         self.calls.append(("LMD", mode))
+
+    async def async_select_source(self, source: str) -> None:
+        self.calls.append(("select_source", source))
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -275,6 +289,88 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("LMD", "stereo"), calls)
         self.assertIn(("refresh", ""), calls)
         self.assertIn(("refresh", ""), zone2.coordinator.calls)
+
+    async def test_set_source_service_calls_select_source(self) -> None:
+        """set_source service calls coordinator.async_select_source with the mapped eISCP alias."""
+        runtime = type("Runtime", (), {})()
+        runtime.entity_ids = {"media_player.onkyo_pr_sc5507"}
+        runtime.coordinator = FakeCoordinator()
+        runtime.sources = {"Blu-ray": "dvd"}
+        runtime.zones = (runtime,)
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+
+        await self.init_module._async_register_services(self.hass)
+        await self.hass.services.async_call(
+            "onkyo_legacy",
+            "set_source",
+            {"entity_id": "media_player.onkyo_pr_sc5507", "source": "Blu-ray"},
+        )
+
+        self.assertIn(("select_source", "dvd"), runtime.coordinator.calls)
+
+    async def test_set_source_service_invalid_source_raises(self) -> None:
+        """set_source with an unknown source name raises vol.Invalid."""
+        import voluptuous as vol
+
+        runtime = type("Runtime", (), {})()
+        runtime.entity_ids = {"media_player.onkyo_pr_sc5507"}
+        runtime.coordinator = FakeCoordinator()
+        runtime.sources = {"Blu-ray": "dvd"}
+        runtime.zones = (runtime,)
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+
+        await self.init_module._async_register_services(self.hass)
+
+        with self.assertRaises(vol.Invalid):
+            await self.hass.services.async_call(
+                "onkyo_legacy",
+                "set_source",
+                {
+                    "entity_id": "media_player.onkyo_pr_sc5507",
+                    "source": "INVALID-SOURCE",
+                },
+            )
+
+    async def test_set_volume_service_calls_set_volume(self) -> None:
+        """set_volume service sends the hex-encoded volume to the zone volume command."""
+        runtime = type("Runtime", (), {})()
+        runtime.entity_ids = {"media_player.onkyo_pr_sc5507"}
+        coordinator = FakeCoordinator()
+        runtime.coordinator = coordinator
+        zone_def = type("ZoneDef", (), {"volume_command": "MVL"})()
+        runtime.zone = zone_def
+        runtime.zones = (runtime,)
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+
+        await self.init_module._async_register_services(self.hass)
+        await self.hass.services.async_call(
+            "onkyo_legacy",
+            "set_volume",
+            {"entity_id": "media_player.onkyo_pr_sc5507", "volume": 50},
+        )
+
+        # volume=50 -> format(50, "02X") = "32"
+        self.assertIn(("MVL", "32"), coordinator.client.sent)
+        self.assertIn(("refresh", ""), coordinator.calls)
+
+    async def test_set_dimmer_service_calls_set_dimmer(self) -> None:
+        """set_dimmer service sends the dimmer level string to the DIM command."""
+        runtime = type("Runtime", (), {})()
+        runtime.entity_ids = {"media_player.onkyo_pr_sc5507"}
+        coordinator = FakeCoordinator()
+        runtime.coordinator = coordinator
+        runtime.zones = (runtime,)
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+
+        await self.init_module._async_register_services(self.hass)
+        await self.hass.services.async_call(
+            "onkyo_legacy",
+            "set_dimmer",
+            {"entity_id": "media_player.onkyo_pr_sc5507", "level": "bright"},
+        )
+
+        self.assertIn(("DIM", "bright"), coordinator.client.sent)
+        self.assertIn(("refresh", ""), coordinator.calls)
 
     async def test_detect_supported_zones_skips_failing_zone2(self) -> None:
         self_outer = self

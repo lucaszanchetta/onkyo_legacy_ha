@@ -1,0 +1,3 @@
+onkyo-eiscp==1.2.7
+pytest
+ruff

@@ -34,7 +34,7 @@ This integration works with any receiver that supports **eISCP over TCP port 601
 | Model | Type | Zones | Profile |
 |-------|------|-------|---------|
 | PR-SC5507 | AV Processor | Main, Zone 2, Zone 3 | Built-in (22/30 commands queryable) |
-| TX-8050 | Stereo Receiver | Main, Zone 2 | Built-in (11/12 commands queryable) |
+| TX-8050 | Stereo Receiver | Main | Built-in (11/12 commands queryable) |
 
 ### Generic Model Support
 

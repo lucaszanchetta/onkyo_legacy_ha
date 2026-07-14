@@ -843,9 +843,9 @@ def build_runtime_data(
         queryable_commands=profile.queryable_commands,
         source_lookup=source_lookup,
         supported_listening_modes=_build_select_options("LMD"),
-        supported_audio_selectors=_build_select_options("SLA") if normalized_model == MODEL else [],
-        supported_late_night_modes=_build_select_options("LTN") if normalized_model == MODEL else [],
-        supported_audyssey_volume_modes=_build_select_options("ADV") if normalized_model == MODEL else [],
+        supported_audio_selectors=_build_select_options("SLA") if "SLA" in profile.queryable_commands else [],
+        supported_late_night_modes=_build_select_options("LTN") if "LTN" in profile.queryable_commands else [],
+        supported_audyssey_volume_modes=_build_select_options("ADV") if "ADV" in profile.queryable_commands else [],
         supported_dimmer_modes=_build_select_options("DIM"),
         entity_ids=entity_ids,
     )
