@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -11,17 +13,35 @@ class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
-    async def send(self, command: str, value: str) -> None:
+    def send(self, command: str, value: str) -> None:
         self.sent.append((command, value))
 
     def disconnect(self) -> None:
         pass
+
+    def start_listener(self, callback) -> None:
+        self.listener_callback = callback
+
+    def close(self) -> None:
+        pass
+
+    def begin_close(self) -> None:
+        self._closing = True
 
 
 class FakeCoordinator:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.client = FakeClient()
+        self.last_update_success = False
+
+    def set_command_capability(self, command: str, supported: bool) -> None:
+        self.capabilities = getattr(self, "capabilities", {})
+        self.capabilities[command] = supported
+
+    async def async_refresh(self) -> None:
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+        raise UpdateFailed("offline fake")
 
     async def async_request_refresh(self) -> None:
         self.calls.append(("refresh", ""))
@@ -31,6 +51,15 @@ class FakeCoordinator:
 
     async def async_select_source(self, source: str) -> None:
         self.calls.append(("select_source", source))
+
+    async def async_set_volume(self, value: float, max_volume: int) -> None:
+        target = round(value * max_volume)
+        self.client.sent.append(("MVL", f"{target:02X}"))
+        self.calls.append(("refresh", ""))
+
+    async def async_set_dimmer_level(self, level: str) -> None:
+        self.client.sent.append(("DIM", level))
+        self.calls.append(("refresh", ""))
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +129,32 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["title"], "Onkyo TX-8050")
         self.assertEqual(result["data"]["model"], "TX-8050")
+
+    async def test_connection_validation_queries_power_with_unprefixed_command(self) -> None:
+        class Client:
+            def __init__(self, host, port, retries):
+                self.queries = []
+                self.disconnected = False
+
+            def query(self, command):
+                self.queries.append(command)
+                return "PWR01"
+
+            def disconnect(self):
+                self.disconnected = True
+
+        clients = []
+
+        def make_client(*args, **kwargs):
+            client = Client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        with patch.object(self.config_flow_module, "OnkyoLegacyClient", side_effect=make_client):
+            self.config_flow_module._validate_connection("192.0.2.10", 60128)
+
+        self.assertEqual(clients[0].queries, ["PWR"])
+        self.assertTrue(clients[0].disconnected)
 
     async def test_main_entity_registry_migration_prefers_current_unique_ids(self) -> None:
         entity_registry = sys.modules["homeassistant.helpers.entity_registry"]
@@ -218,6 +273,14 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             return (runtime,)
 
         self.init_module._async_detect_supported_zones = fake_detect
+        runtime = type("Runtime", (), {})()
+        runtime.host = "192.0.2.10"
+        runtime.port = 60128
+        runtime.zone_key = "main"
+        runtime.zones = (runtime,)
+        runtime.candidate_zones = ()
+        runtime.queryable_commands = ("LMD",)
+        runtime.coordinator = FakeCoordinator()
         entry = self.init_module.ConfigEntry(
             entry_id="entry-1",
             data={
@@ -231,16 +294,207 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await self.init_module.async_setup_entry(self.hass, entry)
+        with patch.object(self.init_module, "build_runtime_data", return_value=runtime):
+            result = await self.init_module.async_setup_entry(self.hass, entry)
 
         self.assertTrue(result)
         runtime = self.hass.data["onkyo_legacy"][entry.entry_id]
-        self.assertEqual(runtime.coordinator.command_capabilities["LMD"], True)
+        self.assertEqual(runtime.coordinator.capabilities["LMD"], True)
         self.assertGreaterEqual(len(self.hass.created_tasks), 1)
-
         refresh_task = self.hass.created_tasks[0]
         await refresh_task
         self.assertFalse(runtime.coordinator.last_update_success)
+
+    async def test_failed_platform_unload_keeps_runtime_and_client_open(self) -> None:
+        runtime = type("Runtime", (), {})()
+        client = type("Client", (), {
+            "close": lambda self: self._closed.append(True),
+            "begin_close": lambda self: None,
+        })()
+        client._closed = []
+        runtime.coordinator = type("Coordinator", (), {"client": client})()
+        runtime.initial_refresh_task = None
+        runtime.stop_listener_unsub = lambda: None
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+        self.hass.config_entries.async_unload_platforms = lambda *_: asyncio.sleep(0, result=False)
+        entry = self.init_module.ConfigEntry(entry_id="entry-1", data={})
+
+        result = await self.init_module.async_unload_entry(self.hass, entry)
+
+        self.assertFalse(result)
+        self.assertIs(self.hass.data["onkyo_legacy"]["entry-1"], runtime)
+        self.assertEqual(client._closed, [])
+
+    async def test_successful_unload_closes_client_in_executor(self) -> None:
+        runtime = type("Runtime", (), {})()
+        client = type("Client", (), {
+            "close": lambda self: self._closed.append(True),
+            "begin_close": lambda self: None,
+        })()
+        client._closed = []
+        runtime.coordinator = type("Coordinator", (), {"client": client})()
+        runtime.initial_refresh_task = None
+        runtime.stop_listener_unsub = lambda: None
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+        entry = self.init_module.ConfigEntry(entry_id="entry-1", data={})
+
+        result = await self.init_module.async_unload_entry(self.hass, entry)
+
+        self.assertTrue(result)
+        self.assertNotIn("entry-1", self.hass.data["onkyo_legacy"])
+        self.assertEqual(client._closed, [True])
+
+    async def test_cancelled_unload_waits_for_queued_executor_close(self) -> None:
+        runtime = type("Runtime", (), {})()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        close_ran = threading.Event()
+
+        class Client:
+            def begin_close(self):
+                self.closing = True
+
+            def close(self):
+                close_ran.set()
+
+        client = Client()
+        runtime.coordinator = type("Coordinator", (), {"client": client})()
+        runtime.initial_refresh_task = None
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+
+        def queued_executor(func, *args):
+            close_started.set()
+            release_close.wait()
+            func(*args)
+
+        self.hass.async_add_executor_job = lambda func, *args: self.hass.loop.run_in_executor(
+            None, queued_executor, func, *args
+        )
+        entry = self.init_module.ConfigEntry(entry_id="entry-1", data={})
+        unload_task = asyncio.create_task(self.init_module.async_unload_entry(self.hass, entry))
+        self.assertTrue(await asyncio.to_thread(close_started.wait, 1))
+        self.assertNotIn("entry-1", self.hass.data["onkyo_legacy"])
+        unload_task.cancel()
+        release_close.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await unload_task
+        self.assertTrue(close_ran.is_set())
+
+    async def test_cancelled_unload_waits_for_initial_refresh_cleanup(self) -> None:
+        runtime = type("Runtime", (), {})()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        close_ran = threading.Event()
+
+        class Client:
+            def begin_close(self):
+                self.closing = True
+
+            def close(self):
+                close_ran.set()
+
+        async def initial_refresh():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        task = asyncio.create_task(initial_refresh())
+        runtime.initial_refresh_task = task
+        runtime.coordinator = type(
+            "Coordinator", (), {"client": Client()}
+        )()
+        runtime.stop_listener_unsub = lambda: None
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+        self.hass.async_add_executor_job = lambda func, *args: self.hass.loop.run_in_executor(
+            None, func, *args
+        )
+        entry = self.init_module.ConfigEntry(entry_id="entry-1", data={})
+        unload_task = asyncio.create_task(self.init_module.async_unload_entry(self.hass, entry))
+        await cleanup_started.wait()
+        unload_task.cancel()
+        release_cleanup.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await unload_task
+        self.assertTrue(close_ran.is_set())
+        self.assertTrue(task.done())
+
+    async def test_setup_cancellation_during_probe_closes_client(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        runtime = type("Runtime", (), {})()
+        runtime.host = "192.0.2.10"
+        runtime.port = 60128
+        runtime.zone_key = "main"
+        runtime.zones = (runtime,)
+        runtime.candidate_zones = ()
+        runtime.queryable_commands = ("LMD",)
+        runtime.coordinator = FakeCoordinator()
+        client = runtime.coordinator.client
+
+        def blocked_power_query(command, timeout=1.5):
+            started.set()
+            release.wait(1.0)
+            return "PWR01"
+
+        client.query_optional = blocked_power_query
+        self.init_module._async_detect_supported_zones = lambda _runtime: asyncio.sleep(0, result=(runtime,))
+        entry = self.init_module.ConfigEntry(
+            entry_id="cancel-probe",
+            data={
+                "host": "192.0.2.10",
+                "port": 60128,
+                "name": "Generic Receiver",
+                "model": "UNKNOWN-MODEL",
+                "scan_interval": 10,
+                "max_volume": 80,
+                "sources": {},
+            },
+        )
+        with patch.object(self.init_module, "build_runtime_data", return_value=runtime):
+            task = asyncio.create_task(self.init_module.async_setup_entry(self.hass, entry))
+            self.assertTrue(await asyncio.to_thread(started.wait, 1.0))
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(getattr(client, "_closing", False))
+        self.assertNotIn(entry.entry_id, self.hass.data["onkyo_legacy"])
+
+    async def test_setup_cancellation_during_forwarding_cleans_executor_future(self) -> None:
+        runtime = type("Runtime", (), {})()
+        runtime.host = "192.0.2.10"
+        runtime.port = 60128
+        runtime.zone_key = "main"
+        runtime.zones = (runtime,)
+        runtime.candidate_zones = ()
+        runtime.queryable_commands = ()
+        runtime.coordinator = FakeCoordinator()
+        self.init_module._async_detect_supported_zones = lambda _runtime: asyncio.sleep(0, result=(runtime,))
+        async def cancel_forward(_entry, _platforms):
+            raise asyncio.CancelledError
+        self.hass.config_entries.async_forward_entry_setups = cancel_forward
+        self.hass.async_add_executor_job = lambda func, *args: self.hass.loop.run_in_executor(None, func, *args)
+        entry = self.init_module.ConfigEntry(
+            entry_id="cancel-forward",
+            data={
+                "host": "192.0.2.10",
+                "port": 60128,
+                "name": "Known Receiver",
+                "model": "PR-SC5507",
+                "scan_interval": 10,
+                "max_volume": 80,
+                "sources": {},
+            },
+        )
+        with patch.object(self.init_module, "build_runtime_data", return_value=runtime):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.init_module.async_setup_entry(self.hass, entry)
+
+        self.assertNotIn(entry.entry_id, self.hass.data["onkyo_legacy"])
+        self.assertTrue(getattr(runtime.coordinator.client, "_closing", False))
 
     async def test_detect_supported_zones_returns_main_only_without_candidates(self) -> None:
         class ProbeCoordinator:

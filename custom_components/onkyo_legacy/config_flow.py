@@ -5,13 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import config_validation as cv
-
-from eiscp import eISCP
 
 from .const import (
     CONF_MAX_VOLUME,
@@ -32,6 +29,7 @@ from .const import (
     MODEL_TX8050,
     PROFILES,
 )
+from .coordinator import OnkyoLegacyClient
 
 __all__ = ["OnkyoLegacyConfigFlow"]
 
@@ -41,11 +39,11 @@ def _validate_connection(host: str, port: int) -> None:
 
     Runs in an executor to avoid blocking the event loop.
     """
-    device = eISCP(host, port)
+    client = OnkyoLegacyClient(host, port, retries=1)
     try:
-        device.raw("!1PWRQSTN")
+        client.query("PWR")
     finally:
-        device.disconnect()
+        client.disconnect()
 
 
 class OnkyoLegacyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):

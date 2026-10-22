@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from enum import Enum, IntFlag
 import importlib
-from pathlib import Path
 import sys
 import types
+from dataclasses import dataclass, field
+from enum import Enum, IntFlag
+from pathlib import Path
 from typing import Any, Callable
 
 # Type-only alias so static analysis tools can resolve `ConfigEntry` references
@@ -510,6 +510,7 @@ class FakeBus:
     def async_listen_once(self, event: str, callback: Callable[..., Any]) -> None:
         self.event = event
         self.callback = callback
+        return lambda: None
 
 
 class FakeHass:
@@ -523,12 +524,15 @@ class FakeHass:
         self.data: dict[str, Any] = {}
         self.services = FakeServices()
         self.bus = FakeBus()
-        self.loop = types.SimpleNamespace(call_soon_threadsafe=lambda fn, *args: None)
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = None
         self.created_tasks: list[Any] = []
         self.config_entries = FakeConfigEntries()
 
     async def async_add_executor_job(self, func: Callable[..., Any], *args: Any) -> Any:
-        return func(*args)
+        return await asyncio.to_thread(func, *args)
 
     def async_create_task(self, coro: Any) -> Any:
         task = asyncio.create_task(coro)

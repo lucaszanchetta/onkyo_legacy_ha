@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import socket
+import struct
+import threading
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tests.helpers import FakeHass, fresh_import
 
@@ -11,8 +15,10 @@ class FakeClient:
     def __init__(self, responses: dict[str, str]) -> None:
         self.responses = responses
         self.sent: list[tuple[str, str]] = []
+        self.queried: list[str] = []
 
     def query(self, command: str) -> str:
+        self.queried.append(command)
         response = self.responses.get(command)
         if isinstance(response, Exception):
             raise response
@@ -20,7 +26,11 @@ class FakeClient:
             raise ValueError(f"missing response for {command}")
         return response
 
+    def query_optional(self, command: str, timeout: float = 1.5) -> str:
+        return self.query(command)
+
     def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
+        self.queried.extend(commands)
         results: dict[str, str] = {}
         for command in commands:
             response = self.responses.get(command)
@@ -187,7 +197,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_update_data_parses_prsc5507_queryable_state(self) -> None:
         client = FakeClient(
             {
-                "PWR": "PWR00",
+                "PWR": "PWR01",
                 "MVL": "MVL00",
                 "AMT": "AMT00",
                 "SLI": "SLI02",
@@ -236,30 +246,20 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         ):
             coordinator.set_command_capability(command, True)
 
-        state = await coordinator._async_update_data()
+        state = None
+        for _ in range(10):
+            state = await coordinator._async_update_data()
 
-        self.assertFalse(state.power)
+        self.assertTrue(state.power)
         self.assertEqual(state.volume, 0)
         self.assertFalse(state.muted)
         self.assertEqual(state.source, "video3")
-        self.assertEqual(state.audio_selector, "auto")
-        self.assertEqual(state.listening_mode, "ALL CH STEREO")
-        self.assertEqual(state.late_night_mode, "off")
-        self.assertTrue(state.cinema_filter)
-        self.assertTrue(state.audyssey_dynamic_eq)
-        self.assertEqual(state.audyssey_dynamic_volume, "medium")
-        self.assertTrue(state.music_optimizer)
-        self.assertFalse(state.trigger_a)
-        self.assertTrue(state.trigger_b)
-        self.assertTrue(state.trigger_c)
-        self.assertEqual(state.dimmer_level, "bright")
-        self.assertEqual(state.sleep_minutes, 0)
-        self.assertEqual(state.center_level, 0)
-        self.assertEqual(state.subwoofer_level, 1)
-        self.assertEqual(state.audio_information["input_terminal"], "HDMI 2")
-        self.assertEqual(state.audio_information["listening_mode"], "ALL CH STEREO")
-        self.assertEqual(state.video_information["video_output"], "ANALOG")
-        self.assertEqual(state.video_information["picture_mode"], "CUSTOM")
+        self.assertIsNone(state.audio_selector)
+        self.assertIsNone(state.listening_mode)
+        self.assertEqual(state.audio_information, {})
+        self.assertEqual(state.video_information, {})
+        self.assertIn("IFV", client.queried)
+        self.assertIn("IFA", client.queried)
 
     async def test_update_data_parses_tx8050_audio_only_state(self) -> None:
         client = FakeClient(
@@ -284,6 +284,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         for command in ("LMD", "DIM", "SLP", "TUN"):
             coordinator.set_command_capability(command, True)
 
+        coordinator.data = await coordinator._async_update_data()
+        coordinator.data = await coordinator._async_update_data()
         state = await coordinator._async_update_data()
 
         self.assertTrue(state.power)
@@ -294,6 +296,71 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.dimmer_level, "dim")
         self.assertEqual(state.sleep_minutes, 30)
         self.assertEqual(state.tuner_frequency, 10710)
+
+    async def test_dimmer_service_accepts_raw_code_and_rejects_invalid_value(self) -> None:
+        client = FakeClient({"PWR": "PWR00"})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10
+        )
+        await coordinator.async_set_dimmer_level("01")
+        self.assertIn(("DIM", "01"), client.sent)
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator.async_set_dimmer_level("not-a-level")
+
+    async def test_optional_write_refresh_prioritizes_new_state(self) -> None:
+        client = FakeClient(
+            {
+                "PWR": "PWR01",
+                "MVL": "MVL20",
+                "AMT": "AMT00",
+                "SLI": "SLI00",
+                "LMD": "LMD00",
+                "DIM": "DIM01",
+            }
+        )
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10
+        )
+        for command in self.module.GENERIC_PROFILE.queryable_commands:
+            coordinator.set_command_capability(command, True)
+        coordinator._optional_failures["LMD"] = (3, time.monotonic() + 3600)
+        coordinator._optional_failures["DIM"] = (3, time.monotonic() + 3600)
+
+        await coordinator.async_set_listening_mode("stereo")
+        self.assertEqual(coordinator.data.listening_mode, "stereo")
+        self.assertIn("LMD", client.queried)
+
+        await coordinator.async_set_dimmer_level("01")
+        self.assertEqual(coordinator.data.dimmer_level, "dim")
+        self.assertEqual(coordinator.data.listening_mode, "stereo")
+        self.assertIn("DIM", client.queried)
+
+    async def test_video_information_merges_across_full_optional_rotation(self) -> None:
+        client = FakeClient(
+            {
+                "PWR": "PWR01",
+                "MVL": "MVL20",
+                "AMT": "AMT00",
+                "SLI": "SLI00",
+                "IFV": "IFVnew-input,,,,new-output,,,,,",
+            }
+        )
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10
+        )
+        for command in self.module.GENERIC_PROFILE.queryable_commands:
+            coordinator.set_command_capability(command, True)
+        coordinator.data = self.module.OnkyoState(
+            power=True,
+            video_information={"video_input": "old-input", "custom": "preserve"},
+        )
+
+        for _ in range(10):
+            coordinator.data = await coordinator._async_update_data()
+
+        self.assertEqual(coordinator.data.video_information["video_input"], "NEW-INPUT")
+        self.assertEqual(coordinator.data.video_information["video_output"], "NEW-OUTPUT")
+        self.assertEqual(coordinator.data.video_information["custom"], "preserve")
 
     async def test_update_data_keeps_previous_optional_values_when_queries_fail(self) -> None:
         client = FakeClient(
@@ -399,54 +466,29 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("SLZ", "12"), client.sent)
 
     async def test_query_batch_returns_all_results(self) -> None:
-        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
-        client._host = "test"
-        client._port = 60128
-        client._device = None
-        client._retries = 2
-        client._consecutive_failures = 0
-        client._circuit_open_until = 0.0
-        from threading import Lock
-        client._lock = Lock()
-
-        class FakeDevice:
-            def __init__(self, responses: dict[str, str]) -> None:
-                self._responses = responses
-            def raw(self, msg: str) -> str:
-                cmd = msg[:3]
-                return self._responses[cmd]
-            def disconnect(self) -> None:
-                pass
-
-        device = FakeDevice({"PWR": "PWR01", "MVL": "MVL2A", "SLI": "SLI02"})
-        client._device = device
+        client = self.module.OnkyoLegacyClient("test", 60128)
+        device = object()
+        client._connect = lambda: device  # type: ignore[method-assign]
+        responses = {"PWR": "PWR01", "MVL": "MVL2A", "SLI": "SLI02"}
+        client._query_locked = lambda _device, command, timeout=5.0: responses[command]  # type: ignore[method-assign]
 
         results = client.query_batch(("PWR", "MVL", "SLI"))
 
         self.assertEqual(results, {"PWR": "PWR01", "MVL": "MVL2A", "SLI": "SLI02"})
 
     async def test_query_batch_aborts_on_first_failure(self) -> None:
-        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
-        client._host = "test"
-        client._port = 60128
-        client._device = None
-        client._retries = 1
-        client._consecutive_failures = 0
-        client._circuit_open_until = 0.0
-        from threading import Lock
-        client._lock = Lock()
+        client = self.module.OnkyoLegacyClient("test", 60128, retries=1)
+        client._connect = lambda: object()  # type: ignore[method-assign]
 
-        class FailingDevice:
-            def raw(self, msg: str) -> str:
+        def query(_device, command, timeout=5.0):
+            if command == "MVL":
                 raise TimeoutError("no response")
-            def disconnect(self) -> None:
-                pass
+            return f"{command}01"
 
-        client._device = FailingDevice()
-
-        results = client.query_batch(("PWR", "MVL", "SLI"))
-
-        self.assertEqual(results, {})
+        client._query_locked = query  # type: ignore[method-assign]
+        with self.assertRaises(TimeoutError):
+            client.query_batch(("PWR", "MVL", "SLI"))
+        self.assertEqual(client._consecutive_failures, 1)
 
     async def test_update_data_raises_when_core_command_missing_from_batch(self) -> None:
         client = FakeClient({"PWR": "PWR01"})
@@ -479,51 +521,29 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
 
     async def test_circuit_breaker_resets_on_success(self) -> None:
-        """After 4 failures and 1 success, _consecutive_failures should be 0."""
-        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
-
-        mock_device = MagicMock()
-        call_count = 0
-
-        def raw_side_effect(msg: str) -> str:
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 4:
-                raise OSError("device busy")
-            return "PWR01"
-
-        mock_device.raw.side_effect = raw_side_effect
-        mock_device.disconnect.return_value = None
-        client._device = mock_device
-        client._connect = lambda: mock_device
-
-        for _ in range(4):
-            with self.assertRaises(OSError):
-                client.query("PWR")
-
-        self.assertEqual(client._consecutive_failures, 4)
-
-        result = client.query("PWR")
-        self.assertEqual(result, "PWR01")
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        client._query_once = lambda command: "PWR01"  # type: ignore[method-assign]
+        client._consecutive_failures = 3
+        client._circuit_open_until = time.monotonic() - 1
+        self.assertEqual(client.query("PWR"), "PWR01")
         self.assertEqual(client._consecutive_failures, 0)
+        self.assertEqual(client._circuit_open_until, 0.0)
 
     async def test_circuit_breaker_opens_after_consecutive_failures(self) -> None:
-        """After 5 consecutive failures, _circuit_open_until should be set."""
-        client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
-
-        mock_device = MagicMock()
-        mock_device.raw.side_effect = OSError("device busy")
-        mock_device.disconnect.return_value = None
-        client._device = mock_device
-        client._connect = lambda: mock_device
-
-        before = time.monotonic()
-        for _ in range(5):
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        now = [100.0]
+        with patch.object(self.module.time, "monotonic", side_effect=lambda: now[0]):
+            client._query_once = lambda command: (_ for _ in ()).throw(OSError("down"))  # type: ignore[method-assign]
             with self.assertRaises(OSError):
                 client.query("PWR")
-
-        self.assertEqual(client._consecutive_failures, 5)
-        self.assertGreater(client._circuit_open_until, before)
+            self.assertEqual(client._circuit_open_until, 102.0)
+            with self.assertRaises(ConnectionError):
+                client.query("PWR")
+            now[0] = 102.0
+            with self.assertRaises(OSError):
+                client.query("PWR")
+            self.assertEqual(client._consecutive_failures, 2)
+            self.assertEqual(client._circuit_open_until, 106.0)
 
     async def test_circuit_breaker_blocks_when_open(self) -> None:
         """When circuit is open, calls should raise ConnectionError immediately."""
@@ -537,17 +557,13 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             client.query("PWR")
 
     async def test_circuit_breaker_recovers_after_cooldown(self) -> None:
-        """After the 30s cooldown, calls should succeed again."""
+        """Calls recover after the capped cooldown expires."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
         client._circuit_open_until = time.monotonic() - 1  # just expired
         client._consecutive_failures = 5
 
-        mock_device = MagicMock()
-        mock_device.raw.return_value = "PWR01"
-        mock_device.send.return_value = None
-        mock_device.disconnect.return_value = None
-        client._device = mock_device
-        client._connect = lambda: mock_device
+        client._query_once = lambda command: "PWR01"  # type: ignore[method-assign]
+        client._send_once = lambda command, value: None  # type: ignore[method-assign]
 
         result = client.query("PWR")
         self.assertEqual(result, "PWR01")
@@ -555,24 +571,34 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         client.send("MVL", "UP")
 
+    async def test_reconnect_cooldown_caps_at_one_minute(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        now = [10.0]
+        client._query_once = lambda command: (_ for _ in ()).throw(OSError("down"))  # type: ignore[method-assign]
+        with patch.object(self.module.time, "monotonic", side_effect=lambda: now[0]):
+            for index in range(2000):
+                with self.assertRaises(OSError):
+                    client.query("PWR")
+                delay = client._circuit_open_until - now[0]
+                self.assertGreater(delay, 0)
+                if index == 0:
+                    self.assertAlmostEqual(delay, 2.0)
+                self.assertLessEqual(delay, 60.0)
+                now[0] += delay
+
     async def test_circuit_breaker_reopens_after_recovery_failure(self) -> None:
         """After cooldown, if the next call fails, circuit should re-open."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128, retries=1)
         client._consecutive_failures = 5
         client._circuit_open_until = time.monotonic() - 1  # just expired
 
-        mock_device = MagicMock()
-        mock_device.raw.side_effect = OSError("device busy")
-        mock_device.disconnect.return_value = None
-        client._device = mock_device
-        client._connect = lambda: mock_device
+        client._query_once = lambda command: (_ for _ in ()).throw(OSError("down"))  # type: ignore[method-assign]
 
-        before = time.monotonic()
         with self.assertRaises(OSError):
             client.query("PWR")
 
         self.assertEqual(client._consecutive_failures, 6)
-        self.assertGreater(client._circuit_open_until, before)
+        self.assertGreater(client._circuit_open_until, time.monotonic())
 
     async def test_send_raises_home_assistant_error_when_circuit_open(self) -> None:
         """Verify that send() surfaces HomeAssistantError when circuit is open."""
@@ -647,41 +673,26 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------
 
     async def test_probe_commands_marks_supported(self) -> None:
-        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
-        client._host = "test"
-        client._port = 60128
-        client._device = None
-        client._retries = 1
-        client._consecutive_failures = 0
-        client._circuit_open_until = 0.0
-        from threading import Lock
-        client._lock = Lock()
+        client = self.module.OnkyoLegacyClient("test", 60128, retries=1)
 
-        def mock_query_once(command: str) -> str:
+        def mock_query_optional(command: str, timeout: float = 1.5) -> str:
             if command == "PWR":
                 return "PWR01"
-            raise OSError("no response")
+            raise self.module.CommandResponseTimeout("no response")
 
-        client._query_once = mock_query_once  # type: ignore[assignment]
+        client.query_optional = mock_query_optional  # type: ignore[method-assign]
 
         results = client.probe_commands(("PWR", "XYZ"))
         self.assertEqual(results, {"PWR": True, "XYZ": False})
 
     async def test_probe_commands_does_not_trip_circuit_breaker(self) -> None:
-        client = self.module.OnkyoLegacyClient.__new__(self.module.OnkyoLegacyClient)
-        client._host = "test"
-        client._port = 60128
-        client._device = None
-        client._retries = 1
+        client = self.module.OnkyoLegacyClient("test", 60128, retries=1)
         client._consecutive_failures = 2
-        client._circuit_open_until = 0.0
-        from threading import Lock
-        client._lock = Lock()
 
-        def failing_query_once(command: str) -> str:
-            raise OSError("no response")
+        def failing_query_optional(command: str, timeout: float = 1.5) -> str:
+            raise self.module.CommandResponseTimeout("no response")
 
-        client._query_once = failing_query_once  # type: ignore[assignment]
+        client.query_optional = failing_query_optional  # type: ignore[method-assign]
 
         commands = ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10")
         results = client.probe_commands(commands)
@@ -697,8 +708,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         """Starting a listener creates a background thread."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
         mock_device = MagicMock()
-        mock_device.get.side_effect = TimeoutError
         client._connect = lambda: mock_device  # type: ignore[assignment]
+        client._read_message = lambda device, timeout: None  # type: ignore[method-assign]
 
         client.start_listener(lambda msg: None)
         try:
@@ -711,8 +722,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         """Stopping a listener joins and clears the thread."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
         mock_device = MagicMock()
-        mock_device.get.side_effect = TimeoutError
         client._connect = lambda: mock_device  # type: ignore[assignment]
+        client._read_message = lambda device, timeout: None  # type: ignore[method-assign]
 
         client.start_listener(lambda msg: None)
         client.stop_listener()
@@ -722,8 +733,14 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         """Listener thread delivers unsolicited ISCP messages to the callback."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
         mock_device = MagicMock()
-        mock_device.get.side_effect = ["PWR01", TimeoutError()]
         client._connect = lambda: mock_device  # type: ignore[assignment]
+        messages = iter(["PWR01", None])
+        def read_message(device, timeout):
+            value = next(messages, None)
+            if value is None:
+                time.sleep(0.01)
+            return value
+        client._read_message = read_message  # type: ignore[method-assign]
 
         coordinator = self.module.OnkyoLegacyCoordinator(
             self.hass,
@@ -734,7 +751,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         client.start_listener(coordinator._handle_push_message)
-        time.sleep(0.3)
+        await asyncio.sleep(0.05)
 
         try:
             self.assertTrue(coordinator.data.power)
@@ -753,6 +770,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.data = self.module.OnkyoState(power=False)
 
         coordinator._handle_push_message("PWR01")
+        await asyncio.sleep(0)
 
         self.assertTrue(coordinator.data.power)
 
@@ -768,6 +786,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.data = self.module.OnkyoState(volume=0)
 
         coordinator._handle_push_message("MVL1A")
+        await asyncio.sleep(0)
 
         self.assertEqual(coordinator.data.volume, 26)
 
@@ -783,6 +802,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.data = self.module.OnkyoState(muted=False)
 
         coordinator._handle_push_message("AMT01")
+        await asyncio.sleep(0)
 
         self.assertTrue(coordinator.data.muted)
 
@@ -798,6 +818,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.data = self.module.OnkyoState(source=None)
 
         coordinator._handle_push_message("SLI02")
+        await asyncio.sleep(0)
 
         self.assertEqual(coordinator.data.source, "video3")
 
@@ -822,20 +843,292 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         # Send a volume push that only updates one core field
         coordinator._handle_push_message("MVL1A")
+        await asyncio.sleep(0)
 
         self.assertEqual(coordinator.data.volume, 26)
         self.assertEqual(coordinator.data.listening_mode, "ALL CH STEREO")
         self.assertEqual(coordinator.data.dimmer_level, "dim")
         self.assertEqual(coordinator.data.audio_selector, "auto")
 
-    async def test_disconnect_stops_listener(self) -> None:
-        """disconnect() stops the listener thread."""
+    async def test_disconnect_keeps_listener_and_close_stops_it(self) -> None:
+        """Socket recovery leaves listener alive; close stops it."""
         client = self.module.OnkyoLegacyClient(host="127.0.0.1", port=60128)
         mock_device = MagicMock()
-        mock_device.get.side_effect = TimeoutError
         mock_device.disconnect.return_value = None
         client._connect = lambda: mock_device  # type: ignore[assignment]
+        client._read_message = lambda device, timeout: None  # type: ignore[method-assign]
 
         client.start_listener(lambda msg: None)
         client.disconnect()
+        self.assertIsNotNone(client._listener_thread)
+        client.close()
         self.assertIsNone(client._listener_thread)
+
+    async def test_framed_reader_handles_fragmented_header_and_body(self) -> None:
+        reader, writer = socket.socketpair()
+        device = type("Device", (), {"command_socket": reader})()
+        payload = b"!1PWR01\x1a\r"
+        frame = struct.pack("!4sIIB3s", b"ISCP", 16, len(payload), 1, b"\0\0\0") + payload
+
+        def send_fragments():
+            for part in (frame[:3], frame[3:16], frame[16:19], frame[19:]):
+                writer.sendall(part)
+                time.sleep(0.01)
+
+        sender = threading.Thread(target=send_fragments)
+        sender.start()
+        try:
+            message = self.module.OnkyoLegacyClient._read_message(device, 1.0)
+            self.assertEqual(message, "PWR01")
+        finally:
+            sender.join()
+            reader.close()
+            writer.close()
+
+    async def test_framed_reader_treats_eof_mid_body_as_connection_failure(self) -> None:
+        reader, writer = socket.socketpair()
+        device = type("Device", (), {"command_socket": reader})()
+        header = struct.pack("!4sIIB3s", b"ISCP", 16, 8, 1, b"\0\0\0")
+        writer.sendall(header + b"!1P")
+        writer.close()
+        try:
+            with self.assertRaises(ConnectionError):
+                self.module.OnkyoLegacyClient._read_message(device, 1.0)
+        finally:
+            reader.close()
+
+    async def test_standby_refresh_sends_only_power_query_on_wire(self) -> None:
+        client_socket, receiver_socket = socket.socketpair()
+        client_socket.setblocking(False)
+
+        class SocketDevice:
+            command_socket = client_socket
+
+            def disconnect(self) -> None:
+                client_socket.close()
+
+        client = self.module.OnkyoLegacyClient("socketpair", 1, retries=1)
+        client._connect = lambda: SocketDevice()  # type: ignore[method-assign]
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="socketpair", name="Test", update_interval=10
+        )
+        coordinator.data = self.module.OnkyoState(
+            power=True, volume=31, muted=True, source="cd", video_information={"video_input": "old"}
+        )
+
+        received: list[bytes] = []
+
+        def receiver():
+            header = receiver_socket.recv(16)
+            size = struct.unpack("!4sIIB3s", header)[2]
+            body = receiver_socket.recv(size)
+            received.append(header + body)
+            payload = b"!1PWR00\x1a\r"
+            response = struct.pack("!4sIIB3s", b"ISCP", 16, len(payload), 1, b"\0\0\0") + payload
+            receiver_socket.sendall(response)
+
+        server = threading.Thread(target=receiver)
+        server.start()
+        try:
+            state = await coordinator._async_update_data()
+            server.join()
+            self.assertEqual(len(received), 1)
+            self.assertIn(b"PWRQSTN", received[0])
+            self.assertFalse(state.power)
+            self.assertEqual(state.volume, 31)
+            self.assertEqual(state.source, "cd")
+            self.assertEqual(state.video_information, {"video_input": "old"})
+        finally:
+            client.close()
+            receiver_socket.close()
+
+    async def test_query_serializes_listener_and_preserves_push_during_response(self) -> None:
+        client_socket, receiver_socket = socket.socketpair()
+        client_socket.setblocking(False)
+
+        class SocketDevice:
+            command_socket = client_socket
+            def send(self, command: str) -> None:
+                packet = self.module_packet(command)
+                client_socket.sendall(packet)
+            @staticmethod
+            def module_packet(command: str) -> bytes:
+                from eiscp.core import command_to_packet
+                return command_to_packet(command)
+            def disconnect(self) -> None:
+                client_socket.close()
+
+        device = SocketDevice()
+        client = self.module.OnkyoLegacyClient("socketpair", 1, retries=1)
+        client._connect = lambda: device  # type: ignore[method-assign]
+        pushed: list[str] = []
+        push = b"!1MVL1A\x1a\r"
+        response = b"!1PWR01\x1a\r"
+        push_frame = struct.pack("!4sIIB3s", b"ISCP", 16, len(push), 1, b"\0\0\0") + push
+        response_frame = struct.pack("!4sIIB3s", b"ISCP", 16, len(response), 1, b"\0\0\0") + response
+
+        push_seen = threading.Event()
+
+        def on_push(message: str) -> None:
+            pushed.append(message)
+            push_seen.set()
+
+        def receiver():
+            receiver_socket.sendall(push_frame)
+            receiver_socket.recv(1024)
+            receiver_socket.sendall(push_frame + response_frame)
+
+        server = threading.Thread(target=receiver)
+        server.start()
+        client.start_listener(on_push)
+        try:
+            self.assertTrue(await asyncio.to_thread(push_seen.wait, 1.0))
+            self.assertEqual(client.query("PWR"), "PWR01")
+            self.assertGreaterEqual(pushed.count("MVL1A"), 1)
+        finally:
+            server.join()
+            receiver_socket.close()
+            client.close()
+
+    async def test_listener_push_recovery_survives_socket_reset(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128)
+        device = MagicMock()
+        client._connect = lambda: device  # type: ignore[method-assign]
+        messages = iter([None, "PWR01", None])
+        delivered = threading.Event()
+
+        def read_message(_device, _timeout):
+            message = next(messages, None)
+            if message:
+                delivered.set()
+            else:
+                time.sleep(0.01)
+            return message
+
+        client._read_message = read_message  # type: ignore[method-assign]
+        received: list[str] = []
+        client.start_listener(received.append)
+        try:
+            client.disconnect()
+            self.assertTrue(await asyncio.to_thread(delivered.wait, 1.0))
+            self.assertEqual(received, ["PWR01"])
+            self.assertIsNotNone(client._listener_thread)
+        finally:
+            client.close()
+
+    async def test_optional_timeout_and_transport_timeout_have_distinct_policy(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        resets: list[bool] = []
+        client._reset_socket = lambda: resets.append(True)  # type: ignore[method-assign]
+        client._query_once = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            self.module.CommandResponseTimeout("no matching response")
+        )  # type: ignore[method-assign]
+        with self.assertRaises(self.module.CommandResponseTimeout):
+            client.query_optional("DIM")
+        self.assertEqual(client._consecutive_failures, 0)
+        self.assertEqual(resets, [])
+
+        client._query_once = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TimeoutError("socket send timed out")
+        )  # type: ignore[method-assign]
+        with self.assertRaises(TimeoutError):
+            client.query_optional("DIM")
+        self.assertEqual(client._consecutive_failures, 1)
+        self.assertEqual(resets, [True])
+
+    async def test_listener_failure_reset_is_serialized_before_queued_query(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        read_started = threading.Event()
+        release_read = threading.Event()
+        query_waiting = threading.Event()
+        operation_lock = threading.Lock()
+
+        class ObservableLock:
+            def __enter__(self):
+                if threading.current_thread().name == "queued-query":
+                    query_waiting.set()
+                operation_lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                operation_lock.release()
+
+        client._operation_lock = ObservableLock()
+        disconnects: list[bool] = []
+        device = MagicMock()
+        device.disconnect.side_effect = lambda: disconnects.append(True)
+        connects: list[bool] = []
+
+        def connect():
+            connects.append(True)
+            return device
+
+        def read_message(_device, _timeout):
+            read_started.set()
+            release_read.wait(1)
+            raise OSError("reader failed")
+
+        client._connect = connect  # type: ignore[method-assign]
+        client._device = device
+        client._read_message = read_message  # type: ignore[method-assign]
+        client.start_listener(lambda _message: None)
+        self.assertTrue(await asyncio.to_thread(read_started.wait, 1))
+        query_errors: list[Exception] = []
+
+        def query():
+            try:
+                client.query("PWR")
+            except Exception as err:  # capture the queued cooldown rejection
+                query_errors.append(err)
+
+        query_thread = threading.Thread(target=query, name="queued-query")
+        query_thread.start()
+        self.assertTrue(await asyncio.to_thread(query_waiting.wait, 1))
+        release_read.set()
+        query_thread.join(timeout=1)
+        try:
+            self.assertFalse(query_thread.is_alive())
+            self.assertEqual(connects, [True])
+            self.assertEqual(disconnects, [True])
+            self.assertEqual(len(query_errors), 1)
+            self.assertIsInstance(query_errors[0], ConnectionError)
+        finally:
+            client.close()
+
+    async def test_close_wakes_retry_wait_before_listener_starts(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        failure_seen = threading.Event()
+        wait_started = threading.Event()
+        original_wait = client._wait_cooldown
+        attempts: list[str] = []
+        errors: list[Exception] = []
+
+        def fail_query(command: str, timeout: float = 5.0) -> str:
+            attempts.append(command)
+            failure_seen.set()
+            raise OSError("receiver unavailable")
+
+        def wait_cooldown() -> None:
+            wait_started.set()
+            original_wait()
+
+        client._query_once = fail_query  # type: ignore[method-assign]
+        client._wait_cooldown = wait_cooldown  # type: ignore[method-assign]
+
+        def query() -> None:
+            try:
+                client.query("PWR")
+            except Exception as err:
+                errors.append(err)
+
+        worker = threading.Thread(target=query)
+        worker.start()
+        self.assertTrue(await asyncio.to_thread(failure_seen.wait, 1))
+        self.assertTrue(await asyncio.to_thread(wait_started.wait, 1))
+        client.begin_close()
+        await asyncio.to_thread(worker.join, 1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(client._listener_stop.is_set())
+        self.assertEqual(attempts, ["PWR"])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ConnectionError)

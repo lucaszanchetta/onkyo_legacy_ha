@@ -9,7 +9,7 @@ Custom Home Assistant integration for legacy Onkyo receivers (PR-SC5507, TX-8050
 - **Reconfigure flow** — change host/port post-setup
 - **Extensible model profiles** — built-in profiles for PR-SC5507 and TX-8050, plus a GENERIC profile with automatic capability detection for unknown models
 - **Push/event support** — background listener thread for instant state updates from the receiver, with polling as a safety net
-- **Batched queries** — single-lock multi-command queries reduce overhead from ~20 to 1 call per cycle
+- **Measured polling** — power is checked first, core state is batched while on, and optional commands are staggered two at a time
 - **Circuit breaker** — exponential backoff retries with automatic recovery after connection failures
 - **Zone 2/3 support** — per-zone power, mute, volume, source, and listening mode controls
 - **Diagnostics** — built-in diagnostics for bug reports (config, state, circuit breaker status)
@@ -38,10 +38,10 @@ This integration works with any receiver that supports **eISCP over TCP port 601
 
 ### Generic Model Support
 
-Any unlisted eISCP receiver uses the **GENERIC** profile, which probes all known ISCP commands at startup and enables only the ones the receiver responds to. This means:
+Any unlisted eISCP receiver uses the **GENERIC** profile. It probes optional commands at startup only when a power query reports the receiver is on. At standby startup, optional capabilities remain provisional; while powered on, optional commands are checked two at a time with per-command retry suppression. Those runtime checks preserve polling health but do not change the displayed capability list until setup runs again. This means:
 
 - Core controls (power, volume, mute, source) work on virtually all eISCP receivers
-- Optional controls (listening mode, dimmer, sleep timer, etc.) are auto-detected
+- Optional controls (listening mode, dimmer, sleep timer, etc.) are auto-detected while powered on
 - Zone 2/3 support is detected at startup
 - No manual configuration needed — just enter the IP address
 
@@ -106,7 +106,7 @@ YAML configs are imported into config entries automatically.
 |--------|---------|-------|-------------|
 | `scan_interval` | 10 | 1–60 | Polling interval in seconds |
 | `max_volume` | 80 | 1–200 | Maximum volume slider range |
-| `retries` | 2 | 1–5 | Command retry attempts |
+| `retries` | 2 | 1–5 | Read/query attempts; writes are sent once to avoid repeating ambiguous commands |
 | `strict_sources` | true | — | Fail on unknown source aliases (false = warn and skip) |
 
 ## Entities
@@ -172,10 +172,21 @@ Each receiver creates a Home Assistant device with these entities:
               └─────────────┘
 ```
 
-- **Client** — thread-safe eISCP wrapper with retry, backoff, circuit breaker, batch queries, and probe
-- **Coordinator** — `DataUpdateCoordinator` per zone with batched polling and push message handling
+- **Client** — serialized framed eISCP reader with shared capped reconnect cooldown, batch queries, and probes
+- **Coordinator** — `DataUpdateCoordinator` per zone; core polling precedes optional queries, which are staggered while powered on
 - **Listener** — background daemon thread for unsolicited ISCP messages (push updates)
 - **Profiles** — `ModelProfile` frozen dataclass with per-model capabilities, sources, and zones
+
+### Checking Network Retry Traffic
+
+The integration uses TCP unicast to the configured receiver. Repeated TCP reconnects to an unreachable receiver can cause the host to repeat ARP resolution. Validate any change with matched 120-second captures on the Home Assistant host, using the same receiver power states and network conditions before and after:
+
+```bash
+sudo timeout 120 tcpdump -ni any -w onkyo-before.pcap 'arp or (host 192.168.1.10 and tcp port 60128)'
+sudo timeout 120 tcpdump -ni any -w onkyo-after.pcap 'arp or (host 192.168.1.10 and tcp port 60128)'
+```
+
+Count ARP requests and TCP SYN attempts for the receiver in each capture; repeat for each configured receiver. Local tests do not measure ARP traffic, so they cannot establish a reduction on a live network.
 
 ## Development
 
@@ -185,7 +196,7 @@ Each receiver creates a Home Assistant device with these entities:
 ./.venv/bin/python -m pytest tests/ -v
 ```
 
-74 tests run without a real Home Assistant installation — the test suite uses lightweight stubs.
+Tests run without a real Home Assistant installation; the test suite uses lightweight stubs.
 
 ### Live Smoke Testing
 

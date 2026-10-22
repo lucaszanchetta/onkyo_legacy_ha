@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import timedelta
 import logging
+import select
+import struct
 import threading
 import time
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from threading import Lock
 from typing import Any, Callable
 
-from eiscp import eISCP
 from eiscp import commands as eiscp_commands
+from eiscp import eISCP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -24,8 +26,8 @@ from .const import (
     MANUFACTURER,
     MODEL,
     MODEL_TX8050,
-    ModelProfile,
     PROFILES,
+    ModelProfile,
 )
 
 __all__ = [
@@ -41,6 +43,10 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class CommandResponseTimeout(TimeoutError):
+    """A complete query send received no matching response before timeout."""
 
 
 def _primary_alias(value: Any) -> str:
@@ -258,6 +264,10 @@ class OnkyoLegacyClient:
     """Thread-safe synchronous ISCP client."""
 
     _RETRYABLE_ERRORS = (OSError, TimeoutError, ConnectionError)
+    _COOLDOWN_BASE = 2.0
+    _COOLDOWN_MAX = 60.0
+    _COOLDOWN_MAX_EXPONENT = 5
+    _CONNECT_TIMEOUT = 5.0
 
     def __init__(self, host: str, port: int, retries: int = 2) -> None:
         self._host = host
@@ -270,14 +280,14 @@ class OnkyoLegacyClient:
         self._listener_thread: threading.Thread | None = None
         self._listener_stop: threading.Event = threading.Event()
         self._push_callback: Callable[[str], None] | None = None
+        self._closed = False
+        self._operation_lock = Lock()
 
     def disconnect(self) -> None:
-        """Disconnect the underlying socket."""
-        # Avoid joining ourselves — the listener thread calls into
-        # disconnect() only via the error-handler path, which manages
-        # the device itself.  This guard is a safety net.
-        if threading.current_thread() is not self._listener_thread:
-            self.stop_listener()
+        """Reset the socket while leaving the listener available."""
+        self._reset_socket()
+
+    def _reset_socket(self) -> None:
         with self._lock:
             if self._device is not None:
                 try:
@@ -286,9 +296,36 @@ class OnkyoLegacyClient:
                     pass
                 self._device = None
 
+    def close(self) -> None:
+        """Stop the listener and release the socket permanently."""
+        self.begin_close()
+        self.stop_listener()
+        self._reset_socket()
+
+    def begin_close(self) -> None:
+        """Prevent queued operations from reconnecting during shutdown."""
+        self._closed = True
+        self._listener_stop.set()
+
     def query(self, command: str) -> str:
         """Query a command and return the raw response."""
         return self._with_retry(self._query_once, command)
+
+    def query_optional(self, command: str, timeout: float = 1.5) -> str:
+        """Query an optional command once without delaying core polling."""
+        with self._operation_lock:
+            if self._closed:
+                raise ConnectionError("Onkyo client is closed")
+            if self._cooldown_remaining():
+                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+            try:
+                return self._query_once(command, timeout=timeout)
+            except CommandResponseTimeout:
+                raise
+            except (OSError, TimeoutError, ConnectionError, ValueError):
+                self._record_failure()
+                self._reset_socket()
+                raise
 
     def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
         """Query multiple commands in a single lock acquisition."""
@@ -297,31 +334,35 @@ class OnkyoLegacyClient:
     def probe_commands(self, commands: tuple[str, ...]) -> dict[str, bool]:
         """Probe which commands the receiver responds to.
 
-        Uses _query_once directly to bypass the circuit breaker and retry
-        logic — probe failures for unsupported commands should not count
-        toward the circuit breaker or trigger reconnect delays.
+        Probes use the same retry and cooldown policy as normal queries.
         """
         results: dict[str, bool] = {}
         for command in commands:
+            if self._cooldown_remaining():
+                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
             try:
-                self._query_once(command)
+                self.query_optional(command)
                 results[command] = True
-            except self._RETRYABLE_ERRORS:
+            except CommandResponseTimeout:
                 results[command] = False
+            except (OSError, ConnectionError):
+                raise
         return results
 
     def send(self, command: str, value: str) -> None:
         """Send a raw command without waiting for an acknowledgement."""
-        self._with_retry(self._send_once, command, value)
+        self._with_retry(self._send_once, command, value, retry=False)
 
     def _connect(self) -> eISCP:
+        if self._closed:
+            raise ConnectionError("Onkyo client is closed")
         if self._device is None:
             self._device = eISCP(self._host, self._port)
         return self._device
 
     def start_listener(self, callback: Callable[[str], None]) -> None:
         """Start background listener thread for unsolicited ISCP messages."""
-        if self._listener_thread is not None:
+        if self._closed or self._listener_thread is not None:
             return
         self._listener_stop.clear()
         self._push_callback = callback
@@ -345,96 +386,170 @@ class OnkyoLegacyClient:
         """Background thread: listen for unsolicited ISCP messages."""
         _LOGGER.info("Starting ISCP listener for %s:%s", self._host, self._port)
         while not self._listener_stop.is_set():
-            try:
-                with self._lock:
-                    device = self._connect()
-                message = device.get(timeout=1.0)
-                if message and self._push_callback:
-                    self._push_callback(message)
-            except TimeoutError:
+            remaining = self._cooldown_remaining()
+            if remaining:
+                self._listener_stop.wait(remaining)
                 continue
-            except (OSError, ConnectionError) as err:
-                _LOGGER.debug("Listener connection error, will retry: %s", err)
-                # Disconnect device directly without calling self.disconnect()
-                # to avoid attempting to join the current thread from within
-                # the listener thread itself.
-                with self._lock:
-                    if self._device is not None:
-                        try:
-                            self._device.disconnect()
-                        except OSError:
-                            pass
-                        self._device = None
-                if not self._listener_stop.is_set():
-                    time.sleep(2.0)
-            except Exception as err:
-                _LOGGER.warning("Unexpected listener error: %s", err)
-                with self._lock:
-                    if self._device is not None:
-                        try:
-                            self._device.disconnect()
-                        except OSError:
-                            pass
-                        self._device = None
-                if not self._listener_stop.is_set():
-                    time.sleep(2.0)
+            message: str | None = None
+            failure: Exception | None = None
+            with self._operation_lock:
+                if self._closed:
+                    break
+                if self._cooldown_remaining():
+                    continue
+                try:
+                    with self._lock:
+                        device = self._connect()
+                        message = self._read_message(device, 0.2)
+                except (OSError, TimeoutError, ConnectionError, ValueError) as err:
+                    self._record_failure()
+                    self._reset_socket()
+                    failure = err
+                except Exception as err:
+                    self._record_failure()
+                    self._reset_socket()
+                    failure = err
+            if failure is not None:
+                _LOGGER.debug("Listener connection error, will retry: %s", failure)
+                self._wait_cooldown()
+                continue
+            if message and self._push_callback:
+                self._push_callback(message)
         _LOGGER.info("ISCP listener stopped for %s:%s", self._host, self._port)
 
-    def _query_once(self, command: str) -> str:
+    def _query_once(self, command: str, timeout: float = _CONNECT_TIMEOUT) -> str:
         with self._lock:
-            return self._connect().raw(f"{command}QSTN")
+            return self._query_locked(self._connect(), command, timeout)
+
+    def _query_locked(self, device: eISCP, command: str, timeout: float = _CONNECT_TIMEOUT) -> str:
+        if self._closed:
+            raise ConnectionError("Onkyo client is closed")
+        self._send_packet(device, f"{command}QSTN")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = self._read_message(device, min(0.2, deadline - time.monotonic()))
+            if message and message[:3] == command:
+                return message
+            if message and self._push_callback:
+                self._push_callback(message)
+        raise CommandResponseTimeout(f"Timeout waiting for {command} response")
+
+    @classmethod
+    def _send_packet(cls, device: eISCP, command: str) -> None:
+        from eiscp.core import command_to_packet
+
+        if device.command_socket is None:
+            try:
+                device._ensure_socket_connected()
+            except TimeoutError as err:
+                raise ConnectionError("Timed out connecting to receiver") from err
+        sock = device.command_socket
+        if sock is None:
+            raise ConnectionError("Receiver socket was not established")
+        packet = memoryview(command_to_packet(command))
+        deadline = time.monotonic() + cls._CONNECT_TIMEOUT
+        while packet:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [sock], [], remaining)[1]:
+                raise TimeoutError("Timed out sending ISCP frame")
+            sent = sock.send(packet)
+            if sent <= 0:
+                raise ConnectionError("Receiver closed the ISCP connection")
+            packet = packet[sent:]
+
+    @staticmethod
+    def _read_exact(sock: Any, size: int, deadline: float) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([sock], [], [], remaining)[0]:
+                if chunks:
+                    raise ConnectionError("Incomplete ISCP frame")
+                raise TimeoutError("Timeout waiting for ISCP frame")
+            chunk = sock.recv(size - len(chunks))
+            if not chunk:
+                raise ConnectionError("Receiver closed the ISCP connection")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    @classmethod
+    def _read_message(cls, device: eISCP, timeout: float) -> str | None:
+        sock = device.command_socket
+        if sock is None:
+            try:
+                device._ensure_socket_connected()
+            except TimeoutError as err:
+                raise ConnectionError("Timed out connecting to receiver") from err
+            sock = device.command_socket
+        if sock is None or not select.select([sock], [], [], timeout)[0]:
+            return None
+        deadline = time.monotonic() + timeout
+        header = cls._read_exact(sock, 16, deadline)
+        magic, header_size, data_size, _version, _reserved = struct.unpack("!4sIIB3s", header)
+        if magic != b"ISCP" or header_size != 16 or data_size > 65536:
+            raise ValueError("Invalid ISCP frame header")
+        try:
+            body = cls._read_exact(sock, data_size, deadline)
+        except TimeoutError as err:
+            raise ConnectionError("Incomplete ISCP frame body") from err
+        from eiscp.core import ISCPMessage
+        return ISCPMessage.parse(body.decode("utf-8"))
 
     def _query_batch_once(self, commands: tuple[str, ...]) -> dict[str, str]:
         with self._lock:
             device = self._connect()
             results: dict[str, str] = {}
             for command in commands:
-                try:
-                    results[command] = device.raw(f"{command}QSTN")
-                except self._RETRYABLE_ERRORS:
-                    _LOGGER.debug("Command %s failed in batch, aborting batch", command)
-                    try:
-                        device.disconnect()
-                    except OSError:
-                        pass
-                    self._device = None
-                    break
+                results[command] = self._query_locked(device, command)
             return results
 
     def _send_once(self, command: str, value: str) -> None:
         with self._lock:
-            self._connect().send(f"{command}{value}")
+            self._send_packet(self._connect(), f"{command}{value}")
 
-    def _with_retry(self, method: Any, *args: Any) -> Any:
-        now = time.monotonic()
-        if now < self._circuit_open_until:
-            raise ConnectionError(
-                f"Circuit breaker open for {self._host}:{self._port}"
-            )
-        last_error: Exception | None = None
-        for attempt in range(self._retries):
-            try:
-                result = method(*args)
-                self._consecutive_failures = 0
-                return result
-            except self._RETRYABLE_ERRORS as err:
-                last_error = err
-                _LOGGER.debug(
-                    "ISCP command failed on attempt %s/%s: %s",
-                    attempt + 1, self._retries, err,
-                )
-                self.disconnect()
-                if attempt < self._retries - 1:
-                    time.sleep(min(2 ** attempt, 8))
-        assert last_error is not None
+    def _with_retry(self, method: Any, *args: Any, retry: bool = True) -> Any:
+        with self._operation_lock:
+            if self._closed:
+                raise ConnectionError("Onkyo client is closed")
+            if self._cooldown_remaining():
+                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+            last_error: Exception | None = None
+            attempts = self._retries if retry else 1
+            for attempt in range(attempts):
+                if self._closed:
+                    raise ConnectionError("Onkyo client is closed")
+                try:
+                    result = method(*args)
+                    self._consecutive_failures = 0
+                    self._circuit_open_until = 0.0
+                    return result
+                except self._RETRYABLE_ERRORS + (ValueError,) as err:
+                    last_error = err
+                    self._record_failure()
+                    _LOGGER.debug(
+                        "ISCP command failed on attempt %s/%s: %s",
+                        attempt + 1, attempts, err,
+                    )
+                    self._reset_socket()
+                    if attempt < attempts - 1:
+                        self._wait_cooldown()
+            assert last_error is not None
+            raise last_error
+
+    def _record_failure(self) -> None:
         self._consecutive_failures += 1
-        if self._consecutive_failures >= 5:
-            self._circuit_open_until = time.monotonic() + 30.0
-            _LOGGER.warning(
-                "Circuit breaker opened for %s:%s after %s consecutive failures",
-                self._host, self._port, self._consecutive_failures,
-            )
-        raise last_error
+        delay = min(
+            self._COOLDOWN_BASE
+            * (2 ** min(self._consecutive_failures - 1, self._COOLDOWN_MAX_EXPONENT)),
+            self._COOLDOWN_MAX,
+        )
+        self._circuit_open_until = max(self._circuit_open_until, time.monotonic() + delay)
+
+    def _cooldown_remaining(self) -> float:
+        return max(0.0, self._circuit_open_until - time.monotonic())
+
+    def _wait_cooldown(self) -> None:
+        self._listener_stop.wait(self._cooldown_remaining())
 
 
 @dataclass(slots=True)
@@ -467,6 +582,8 @@ class OnkyoRuntimeData(OnkyoZoneRuntimeData):
     supported_dimmer_modes: list[str] = field(default_factory=list)
     zones: tuple[OnkyoZoneRuntimeData, ...] = field(default_factory=tuple)
     candidate_zones: tuple[OnkyoZoneRuntimeData, ...] = field(default_factory=tuple)
+    initial_refresh_task: Any = None
+    stop_listener_unsub: Any = None
 
 
 class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
@@ -501,6 +618,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self.source_name_to_raw = source_name_to_raw
         self.command_capabilities: dict[str, bool] = {}
         self.data = OnkyoState()
+        self._optional_cursor = 0
+        self._optional_failures: dict[str, tuple[int, float]] = {}
+        self._priority_optional: list[str] = []
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
@@ -513,18 +633,33 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
     async def _async_update_data(self) -> OnkyoState:
         """Fetch the latest state from the device using batched queries."""
+        try:
+            power_results: dict[str, str] = await self.hass.async_add_executor_job(
+                self.client.query_batch, (self.zone.power_command,)
+            )
+        except Exception as err:
+            raise UpdateFailed(f"Power refresh failed: {err}") from err
+        power_raw = power_results.get(self.zone.power_command)
+        if power_raw is None:
+            raise UpdateFailed(f"Core command {self.zone.power_command} missing from response")
+        powered_on = _parse_power(power_raw, self.zone.power_command)
+        previous = self.data or OnkyoState()
+        if not powered_on:
+            return replace(
+                previous,
+                power=False,
+                audio_information=dict(previous.audio_information),
+                video_information=dict(previous.video_information),
+            )
+
         core_commands = (
-            self.zone.power_command,
             self.zone.volume_command,
             self.zone.mute_command,
             self.zone.source_command,
         )
-        optional_commands = self._optional_command_set()
-        all_commands = core_commands + tuple(optional_commands)
-
         try:
             results: dict[str, str] = await self.hass.async_add_executor_job(
-                self.client.query_batch, all_commands
+                self.client.query_batch, core_commands
             )
         except Exception as err:
             raise UpdateFailed(f"State refresh failed: {err}") from err
@@ -534,11 +669,57 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 raise UpdateFailed(f"Core command {cmd} missing from batch response")
 
         state = OnkyoState(
-            power=_parse_power(results[self.zone.power_command], self.zone.power_command),
+            power=True,
             volume=_parse_volume(results[self.zone.volume_command], self.zone.volume_command),
             muted=_parse_mute(results[self.zone.mute_command], self.zone.mute_command),
             source=_parse_enum(results[self.zone.source_command], self.source_raw_to_name),
         )
+        state.video_information = dict(previous.video_information)
+        # Optional commands can be silent or unsupported. Query them only
+        # while powered on and isolate failures so they cannot starve core
+        # health, power, volume, mute, and source updates.
+        if state.power:
+            optional_commands = tuple(sorted(self._optional_command_set()))
+            if optional_commands:
+                count = min(2, len(optional_commands))
+                start = self._optional_cursor % len(optional_commands)
+                rotated = tuple(
+                    optional_commands[(start + offset) % len(optional_commands)]
+                    for offset in range(count)
+                )
+                self._optional_cursor = (start + count) % len(self._optional_command_set())
+                prioritized = tuple(
+                    command
+                    for command in self._priority_optional
+                    if command in optional_commands
+                )
+                optional_commands = tuple(dict.fromkeys(prioritized + rotated))[:count]
+            for command in optional_commands:
+                failures, retry_at = self._optional_failures.get(command, (0, 0.0))
+                if time.monotonic() < retry_at:
+                    continue
+                try:
+                    raw = await self.hass.async_add_executor_job(self.client.query_optional, command)
+                    results[command] = raw
+                    self._optional_failures.pop(command, None)
+                    if command in self._priority_optional:
+                        self._priority_optional.remove(command)
+                except CommandResponseTimeout as err:
+                    _LOGGER.debug("Optional command %s timed out: %s", command, err)
+                    failures += 1
+                    self._optional_failures[command] = (
+                        failures,
+                        time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800),
+                    )
+                    if command in self._priority_optional:
+                        self._priority_optional.remove(command)
+                except Exception as err:
+                    _LOGGER.debug("Optional command %s failed: %s", command, err)
+                    failures += 1
+                    self._optional_failures[command] = (
+                        failures,
+                        time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800),
+                    )
         if self.zone.key != "main":
             for command, value_map in _OPTIONAL_MODE_COMMANDS:
                 if command in self.zone.optional_commands and self.supports(command):
@@ -548,8 +729,6 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             if state.listening_mode is None:
                 state.listening_mode = (self.data or OnkyoState()).listening_mode
             return state
-
-        previous = self.data or OnkyoState()
 
         for command, value_map in _OPTIONAL_MODE_COMMANDS:
             if not self.supports(command):
@@ -596,7 +775,12 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                     existing = getattr(state, attr_name)
                     existing.update(_INFORMATION_PARSERS[command](raw))
                 else:
-                    setattr(state, _OPTIONAL_ATTR_MAP[command], _INFORMATION_PARSERS[command](raw))
+                    attr_name = _OPTIONAL_ATTR_MAP[command]
+                    parsed = _INFORMATION_PARSERS[command](raw)
+                    if attr_name == "video_information":
+                        state.video_information.update(parsed)
+                    else:
+                        setattr(state, attr_name, parsed)
 
         state = _apply_previous_fallbacks(state, previous)
         state.listening_mode = _resolve_listening_mode_display(
@@ -684,7 +868,11 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         await self._async_send(trigger, "01" if enabled else "00")
 
     async def async_set_dimmer_level(self, dimmer_level: str) -> None:
-        raw = DIMMER_NAME_TO_RAW[dimmer_level.lower()]
+        raw = DIMMER_NAME_TO_RAW.get(dimmer_level.lower())
+        if raw is None and dimmer_level.upper() in DIMMER_RAW_TO_NAME:
+            raw = dimmer_level.upper()
+        if raw is None:
+            raise HomeAssistantError(f"Invalid dimmer level: {dimmer_level}")
         await self._async_send("DIM", raw)
 
     async def async_set_audyssey_dynamic_volume(self, option: str) -> None:
@@ -701,6 +889,10 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
     def _handle_push_message(self, message: str) -> None:
         """Handle an unsolicited ISCP message from the listener thread."""
+        self.hass.loop.call_soon_threadsafe(self._apply_push_message, message)
+
+    def _apply_push_message(self, message: str) -> None:
+        """Apply a listener update on the Home Assistant event loop."""
         if len(message) < 3:
             return
         prefix = message[:3]
@@ -745,7 +937,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
         if updated:
             _LOGGER.debug("Push update: %s -> %s", prefix, message[3:])
-            self.hass.loop.call_soon_threadsafe(self.async_set_updated_data, self.data)
+            self.async_set_updated_data(self.data)
 
     def _optional_state_dict(self) -> dict[str, Any]:
         """Copy optional fields from current state for partial updates."""
@@ -779,6 +971,11 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             raise HomeAssistantError(
                 "Onkyo receiver is temporarily unavailable (circuit breaker open)"
             ) from err
+        if command in self._optional_command_set():
+            if command in self._priority_optional:
+                self._priority_optional.remove(command)
+            self._priority_optional.insert(0, command)
+        self._optional_failures.pop(command, None)
         await self.async_request_refresh()
 
 

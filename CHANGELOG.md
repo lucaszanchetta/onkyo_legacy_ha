@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Serialize listener reads and command queries through one framed socket reader; preserve unsolicited updates received during a query and reset connections on partial frames or EOF.
+- Share a capped exponential reconnect cooldown across listener, queries, batches, and probes; send-only writes are not retried.
+- Poll core state before optional commands, limit optional polling to powered-on receivers, and back off independently for silent optional commands.
+- Keep push state mutation on the Home Assistant loop, fan out pushes to active zones, and close clients off-loop during unload while preserving runtime after failed platform unload.
+- Validate config-flow connectivity through the same client, and route volume/dimmer services through coordinator methods.
+
 ## [0.3.0] - 2026-07-14
 
 ### Added

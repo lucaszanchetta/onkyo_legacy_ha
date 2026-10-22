@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
-import voluptuous as vol
-
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_ENTITY_ID
-from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_ENTITY_ID, CONF_HOST, CONF_NAME, CONF_PORT
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
@@ -32,12 +32,17 @@ from .const import (
     PLATFORMS,
     PROFILES,
     SERVICE_REFRESH,
+    SERVICE_SET_DIMMER,
     SERVICE_SET_LISTENING_MODE,
     SERVICE_SET_SOURCE,
     SERVICE_SET_VOLUME,
-    SERVICE_SET_DIMMER,
 )
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData, ZONE_DEFINITIONS, build_runtime_data
+from .coordinator import (
+    ZONE_DEFINITIONS,
+    OnkyoRuntimeData,
+    OnkyoZoneRuntimeData,
+    build_runtime_data,
+)
 
 __all__ = ["async_setup", "async_setup_entry", "async_unload_entry"]
 
@@ -154,51 +159,65 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         retries=entry.data.get(CONF_RETRIES, DEFAULT_RETRIES),
         strict_sources=entry.data.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
     )
-
-    if model in PROFILES:
-        # Known model — trust the hard-coded command list
-        for command in runtime.queryable_commands:
-            runtime.coordinator.set_command_capability(command, True)
-    else:
-        # GENERIC profile — probe which commands the receiver responds to
-        try:
-            results: dict[str, bool] = await hass.async_add_executor_job(
-                runtime.coordinator.client.probe_commands,
-                runtime.queryable_commands,
-            )
-            for command in runtime.queryable_commands:
-                supported = results.get(command, False)
-                runtime.coordinator.set_command_capability(command, supported)
-                if supported:
-                    _LOGGER.info(
-                        "Probed command %s on %s:%s: supported",
-                        command, runtime.host, runtime.port,
-                    )
-                else:
-                    _LOGGER.debug(
-                        "Probed command %s on %s:%s: not supported",
-                        command, runtime.host, runtime.port,
-                    )
-        except (OSError, TimeoutError, ConnectionError) as err:
-            _LOGGER.warning(
-                "Startup probe failed for %s:%s, using all commands as fallback: %s",
-                runtime.host, runtime.port, err,
-            )
+    hass.data[DOMAIN][entry.entry_id] = runtime
+    try:
+        if model in PROFILES:
+            # Known model — trust the hard-coded command list.
             for command in runtime.queryable_commands:
                 runtime.coordinator.set_command_capability(command, True)
+        else:
+            # Standby silence is not evidence that a command is unsupported.
+            try:
+                power = await hass.async_add_executor_job(
+                    runtime.coordinator.client.query_optional, "PWR", 1.5
+                )
+                if power.endswith("01"):
+                    results: dict[str, bool] = await hass.async_add_executor_job(
+                        runtime.coordinator.client.probe_commands,
+                        runtime.queryable_commands,
+                    )
+                else:
+                    results = {command: True for command in runtime.queryable_commands}
+                for command in runtime.queryable_commands:
+                    runtime.coordinator.set_command_capability(
+                        command, results.get(command, True)
+                    )
+            except (OSError, TimeoutError, ConnectionError) as err:
+                _LOGGER.warning(
+                    "Startup probe failed for %s:%s, using all commands as fallback: %s",
+                    runtime.host, runtime.port, err,
+                )
+                for command in runtime.queryable_commands:
+                    runtime.coordinator.set_command_capability(command, True)
 
-    runtime.zones = await _async_detect_supported_zones(runtime)
-    _propagate_zone_command_capabilities(runtime)
-    hass.async_create_task(_async_initial_refresh(runtime))
-    runtime.coordinator.client.start_listener(runtime.coordinator._handle_push_message)
+        runtime.zones = await _async_detect_supported_zones(runtime)
+        _propagate_zone_command_capabilities(runtime)
+        runtime.initial_refresh_task = hass.async_create_task(
+            _async_initial_refresh(runtime)
+        )
 
-    hass.data[DOMAIN][entry.entry_id] = runtime
-    await _async_migrate_main_entity_unique_ids(hass, runtime.host)
-    await _async_remove_unsupported_zone_registry_entries(hass, runtime)
-    await _async_remove_stale_entity_registry_entries(hass, runtime.host)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    hass.bus.async_listen_once("homeassistant_stop", lambda _event: _disconnect_all(hass))
-    return True
+        def _dispatch_push(message: str) -> None:
+            for zone_runtime in runtime.zones:
+                zone_runtime.coordinator._handle_push_message(message)
+
+        runtime.coordinator.client.start_listener(_dispatch_push)
+        await _async_migrate_main_entity_unique_ids(hass, runtime.host)
+        await _async_remove_unsupported_zone_registry_entries(hass, runtime)
+        await _async_remove_stale_entity_registry_entries(hass, runtime.host)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        async def _async_homeassistant_stop(_event) -> None:
+            await _disconnect_all(hass)
+
+        runtime.stop_listener_unsub = hass.bus.async_listen_once(
+            "homeassistant_stop", _async_homeassistant_stop
+        )
+        return True
+    except BaseException:
+        try:
+            await _async_cleanup_runtime(hass, runtime)
+        finally:
+            hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
 
 
 async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
@@ -212,6 +231,33 @@ async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
             runtime.port,
             err,
         )
+
+
+async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData) -> None:
+    """Finish listener, refresh-task, and socket cleanup despite cancellation."""
+    client = runtime.coordinator.client
+    client.begin_close()
+
+    async def _cleanup() -> None:
+        stop_unsub = getattr(runtime, "stop_listener_unsub", None)
+        if stop_unsub:
+            stop_unsub()
+        initial_task = getattr(runtime, "initial_refresh_task", None)
+        if initial_task:
+            initial_task.cancel()
+            await asyncio.gather(initial_task, return_exceptions=True)
+        await hass.async_add_executor_job(client.close)
+
+    cleanup_task = asyncio.create_task(_cleanup())
+    cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup_task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def _async_detect_supported_zones(
@@ -252,10 +298,11 @@ def _propagate_zone_command_capabilities(runtime: OnkyoRuntimeData) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload an Onkyo config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
     runtime = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if runtime is not None:
-        runtime.coordinator.client.stop_listener()
-        runtime.coordinator.client.disconnect()
+        await _async_cleanup_runtime(hass, runtime)
     return unload_ok
 
 
@@ -306,17 +353,15 @@ async def _async_register_services(hass: HomeAssistant) -> None:
     async def async_handle_set_volume(call: ServiceCall) -> None:
         volume = call.data["volume"]
         zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
-        raw = format(volume, "02X")
-        await zone_runtime.coordinator.client.send(
-            zone_runtime.zone.volume_command, raw
+        max_volume = getattr(zone_runtime, "max_volume", DEFAULT_MAX_VOLUME)
+        await zone_runtime.coordinator.async_set_volume(
+            volume / max_volume, max_volume
         )
-        await zone_runtime.coordinator.async_request_refresh()
 
     async def async_handle_set_dimmer(call: ServiceCall) -> None:
-        runtime = _resolve_runtime(hass, call.data.get(CONF_ENTITY_ID))
+        zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
         level = call.data["level"]
-        await runtime.coordinator.client.send("DIM", level)
-        await runtime.coordinator.async_request_refresh()
+        await zone_runtime.coordinator.async_set_dimmer_level(level)
 
     hass.services.async_register(
         DOMAIN,
@@ -384,9 +429,13 @@ def _resolve_zone_runtime(
     return runtime.zones[0]
 
 
-def _disconnect_all(hass: HomeAssistant) -> None:
-    for runtime in hass.data.get(DOMAIN, {}).values():
-        runtime.coordinator.client.disconnect()
+async def _disconnect_all(hass: HomeAssistant) -> None:
+    clients = [
+        runtime.coordinator.client.close
+        for runtime in hass.data.get(DOMAIN, {}).values()
+    ]
+    for close in clients:
+        await hass.async_add_executor_job(close)
 
 
 async def _async_migrate_main_entity_unique_ids(hass: HomeAssistant, host: str) -> None:
