@@ -86,7 +86,9 @@ class _OperationGate:
                     if selected is not None and selected[1] is token:
                         self._waiters.remove(selected)
                         self._active = True
-                        self._high_streak = self._high_streak + 1 if priority == 2 else 0
+                        self._high_streak = (
+                            self._high_streak + 1 if priority == 2 else 0
+                        )
                         if priority == 1:
                             self._core_streak += 1
                         elif priority == 0:
@@ -147,10 +149,14 @@ TRIGGER_A_RAW_TO_NAME, _ = _build_value_maps("main", "TGA")
 TRIGGER_B_RAW_TO_NAME, _ = _build_value_maps("main", "TGB")
 TRIGGER_C_RAW_TO_NAME, _ = _build_value_maps("main", "TGC")
 DIMMER_RAW_TO_NAME, DIMMER_NAME_TO_RAW = _build_value_maps("main", "DIM")
-AUDIO_SELECTOR_RAW_TO_NAME, AUDIO_SELECTOR_NAME_TO_RAW = _build_value_maps("main", "SLA")
+AUDIO_SELECTOR_RAW_TO_NAME, AUDIO_SELECTOR_NAME_TO_RAW = _build_value_maps(
+    "main", "SLA"
+)
 CINEMA_FILTER_RAW_TO_NAME, _ = _build_value_maps("main", "RAS")
 AUDYSSEY_EQ_RAW_TO_NAME, _ = _build_value_maps("main", "ADQ")
-AUDYSSEY_VOLUME_RAW_TO_NAME, AUDYSSEY_VOLUME_NAME_TO_RAW = _build_value_maps("main", "ADV")
+AUDYSSEY_VOLUME_RAW_TO_NAME, AUDYSSEY_VOLUME_NAME_TO_RAW = _build_value_maps(
+    "main", "ADV"
+)
 MUSIC_OPTIMIZER_RAW_TO_NAME, _ = _build_value_maps("main", "MOT")
 
 SOURCE_DISPLAY_OVERRIDES = {
@@ -175,14 +181,36 @@ SOURCE_DISPLAY_OVERRIDES = {
 }
 
 OPTION_ALIAS_EXCLUSIONS: dict[str, set[str]] = {
-    "LMD": {"up", "down", "movie", "music", "game", "thx", "auto", "surr", "stereo", "query"},
+    "LMD": {
+        "up",
+        "down",
+        "movie",
+        "music",
+        "game",
+        "thx",
+        "auto",
+        "surr",
+        "stereo",
+        "query",
+    },
     "SLA": {"up", "query"},
     "LTN": {"up", "query"},
     "ADV": {"up", "query"},
     "DIM": {"query", "shut-off", "bright-led-off"},
 }
 OPTION_RAW_EXCLUSIONS: dict[str, set[str]] = {
-    "LMD": {"UP", "DOWN", "MOVIE", "MUSIC", "GAME", "THX", "AUTO", "SURR", "STEREO", "QSTN"},
+    "LMD": {
+        "UP",
+        "DOWN",
+        "MOVIE",
+        "MUSIC",
+        "GAME",
+        "THX",
+        "AUTO",
+        "SURR",
+        "STEREO",
+        "QSTN",
+    },
     "SLA": {"UP", "QSTN"},
     "LTN": {"UP", "QSTN"},
     "ADV": {"UP", "QSTN"},
@@ -286,8 +314,26 @@ class ZoneDefinition:
 
 ZONE_DEFINITIONS: dict[str, ZoneDefinition] = {
     "main": ZoneDefinition("main", "Main", "main", "PWR", "MVL", "AMT", "SLI"),
-    "zone2": ZoneDefinition("zone2", "Zone 2", "zone2", "ZPW", "ZVL", "ZMT", "SLZ", optional_commands=("LMD",)),
-    "zone3": ZoneDefinition("zone3", "Zone 3", "zone3", "PW3", "VL3", "MT3", "SL3", optional_commands=("LMD",)),
+    "zone2": ZoneDefinition(
+        "zone2",
+        "Zone 2",
+        "zone2",
+        "ZPW",
+        "ZVL",
+        "ZMT",
+        "SLZ",
+        optional_commands=("LMD",),
+    ),
+    "zone3": ZoneDefinition(
+        "zone3",
+        "Zone 3",
+        "zone3",
+        "PW3",
+        "VL3",
+        "MT3",
+        "SL3",
+        optional_commands=("LMD",),
+    ),
 }
 
 
@@ -376,7 +422,9 @@ class OnkyoLegacyClient:
             if self._closed:
                 raise ConnectionError("Onkyo client is closed")
             if self._cooldown_remaining():
-                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+                raise ConnectionError(
+                    f"Receiver cooldown active for {self._host}:{self._port}"
+                )
             try:
                 return self._query_once(command, timeout=timeout)
             except CommandResponseTimeout:
@@ -403,7 +451,9 @@ class OnkyoLegacyClient:
         results: dict[str, bool] = {}
         for command in commands:
             if self._cooldown_remaining():
-                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+                raise ConnectionError(
+                    f"Receiver cooldown active for {self._host}:{self._port}"
+                )
             try:
                 self.query_optional(command)
                 results[command] = True
@@ -485,7 +535,9 @@ class OnkyoLegacyClient:
         with self._lock:
             return self._query_locked(self._connect(), command, timeout)
 
-    def _query_locked(self, device: eISCP, command: str, timeout: float = _CONNECT_TIMEOUT) -> str:
+    def _query_locked(
+        self, device: eISCP, command: str, timeout: float = _CONNECT_TIMEOUT
+    ) -> str:
         if self._closed:
             raise ConnectionError("Onkyo client is closed")
         self._send_packet(device, f"{command}QSTN")
@@ -549,7 +601,9 @@ class OnkyoLegacyClient:
             return None
         deadline = time.monotonic() + timeout
         header = cls._read_exact(sock, 16, deadline)
-        magic, header_size, data_size, _version, _reserved = struct.unpack("!4sIIB3s", header)
+        magic, header_size, data_size, _version, _reserved = struct.unpack(
+            "!4sIIB3s", header
+        )
         if magic != b"ISCP" or header_size != 16 or data_size > 65536:
             raise ValueError("Invalid ISCP frame header")
         try:
@@ -557,6 +611,7 @@ class OnkyoLegacyClient:
         except TimeoutError as err:
             raise ConnectionError("Incomplete ISCP frame body") from err
         from eiscp.core import ISCPMessage
+
         return ISCPMessage.parse(body.decode("utf-8"))
 
     def _send_once(self, command: str, value: str) -> None:
@@ -573,7 +628,9 @@ class OnkyoLegacyClient:
                 self._operation_lock.release()
                 if closed:
                     raise ConnectionError("Onkyo client is closed")
-                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+                raise ConnectionError(
+                    f"Receiver cooldown active for {self._host}:{self._port}"
+                )
             try:
                 result = method(*args)
                 self._consecutive_failures = 0
@@ -581,7 +638,12 @@ class OnkyoLegacyClient:
                 return result
             except self._RETRYABLE_ERRORS + (ValueError,) as err:
                 self._record_failure()
-                _LOGGER.debug("ISCP command failed on attempt %s/%s: %s", attempt + 1, self._retries, err)
+                _LOGGER.debug(
+                    "ISCP command failed on attempt %s/%s: %s",
+                    attempt + 1,
+                    self._retries,
+                    err,
+                )
                 self._reset_socket()
                 if attempt >= (self._retries if retry else 1) - 1:
                     raise
@@ -597,10 +659,16 @@ class OnkyoLegacyClient:
             * (2 ** min(self._consecutive_failures - 1, self._COOLDOWN_MAX_EXPONENT)),
             self._COOLDOWN_MAX,
         )
-        self._circuit_open_until = max(self._circuit_open_until, time.monotonic() + delay)
+        self._circuit_open_until = max(
+            self._circuit_open_until, time.monotonic() + delay
+        )
 
     def _cooldown_remaining(self) -> float:
         return max(0.0, self._circuit_open_until - time.monotonic())
+
+    def cooldown_remaining(self) -> float:
+        """Return seconds remaining in the shared transport cooldown."""
+        return self._cooldown_remaining()
 
     def _wait_cooldown(self) -> None:
         self._listener_stop.wait(self._cooldown_remaining())
@@ -638,6 +706,14 @@ class OnkyoRuntimeData(OnkyoZoneRuntimeData):
     candidate_zones: tuple[OnkyoZoneRuntimeData, ...] = field(default_factory=tuple)
     initial_refresh_task: Any = None
     stop_listener_unsub: Any = None
+    discovery_task: Any = None
+    discovery_states: dict[str, str] = field(default_factory=dict)
+    discovery_timeouts: dict[str, int] = field(default_factory=dict)
+    capability_timeouts: dict[str, int] = field(default_factory=dict)
+    capability_cursor: int = 0
+    platform_adders: dict[str, Callable[[], None]] = field(default_factory=dict)
+    platform_unique_ids: dict[str, set[str]] = field(default_factory=dict)
+    stopping: bool = False
 
 
 class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
@@ -662,7 +738,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             hass,
             _LOGGER,
             name=f"{name} {zone.label.lower()} coordinator",
-            update_interval=None if update_interval <= 0 else timedelta(seconds=update_interval),
+            update_interval=None
+            if update_interval <= 0
+            else timedelta(seconds=update_interval),
         )
         self.client = client
         self.host = host
@@ -678,6 +756,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._push_revisions = dict.fromkeys(("power", "volume", "muted", "source"), 0)
         self._optional_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._core_poll_succeeded = False
+        self._core_poll_completed_at = 0.0
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
@@ -685,11 +765,21 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
     def supports(self, command: str) -> bool:
         return self.command_capabilities.get(command, False)
 
+    @property
+    def core_power_is_fresh(self) -> bool:
+        """Whether the last complete core poll recently confirmed power state."""
+        if not self._core_poll_succeeded:
+            return False
+        interval = self.update_interval
+        max_age = max(30.0, interval.total_seconds() * 2) if interval else 30.0
+        return time.monotonic() - self._core_poll_completed_at <= max_age
+
     async def async_probe_command(self, command: str) -> bool:
         return await self._async_probe_optional(command)
 
     async def _async_update_data(self) -> OnkyoState:
         """Fetch the latest state from the device using batched queries."""
+        self._core_poll_succeeded = False
         # Query-start boundaries conservatively prefer pushes during that query.
         # Each field uses its own batch boundary, so later polls replace older pushes.
         poll_revisions = {"power": self._push_revisions["power"]}
@@ -701,12 +791,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             raise UpdateFailed(f"Power refresh failed: {err}") from err
         power_raw = power_results.get(self.zone.power_command)
         if power_raw is None:
-            raise UpdateFailed(f"Core command {self.zone.power_command} missing from response")
+            raise UpdateFailed(
+                f"Core command {self.zone.power_command} missing from response"
+            )
         powered_on = _parse_power(power_raw, self.zone.power_command)
         previous = self.data or OnkyoState()
         if self._closing:
             raise asyncio.CancelledError
         if not powered_on:
+            self._core_poll_succeeded = True
+            self._core_poll_completed_at = time.monotonic()
             return self._merge_newer_pushes(
                 replace(previous, power=False), poll_revisions
             )
@@ -734,15 +828,21 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
         state = OnkyoState(
             power=True,
-            volume=_parse_volume(results[self.zone.volume_command], self.zone.volume_command),
+            volume=_parse_volume(
+                results[self.zone.volume_command], self.zone.volume_command
+            ),
             muted=_parse_mute(results[self.zone.mute_command], self.zone.mute_command),
-            source=_parse_enum(results[self.zone.source_command], self.source_raw_to_name),
+            source=_parse_enum(
+                results[self.zone.source_command], self.source_raw_to_name
+            ),
         )
         # Optional queries can finish while this core batch is in flight. Use
         # the latest snapshot so the core result retains those newer fields.
         latest = self.data or previous
         state = _apply_previous_fallbacks(state, latest)
         self._start_optional_refresh()
+        self._core_poll_succeeded = True
+        self._core_poll_completed_at = time.monotonic()
         return self._merge_newer_pushes(state, poll_revisions)
 
     def _start_optional_refresh(self) -> None:
@@ -770,16 +870,22 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             return
         count = min(2, len(commands))
         start = self._optional_cursor % len(commands)
-        rotated = tuple(commands[(start + offset) % len(commands)] for offset in range(count))
+        rotated = tuple(
+            commands[(start + offset) % len(commands)] for offset in range(count)
+        )
         self._optional_cursor = (start + count) % len(commands)
-        prioritized = tuple(command for command in self._priority_optional if command in commands)
+        prioritized = tuple(
+            command for command in self._priority_optional if command in commands
+        )
         selected = tuple(dict.fromkeys(prioritized + rotated))[:count]
         for command in selected:
             failures, retry_at = self._optional_failures.get(command, (0, 0.0))
             if time.monotonic() < retry_at:
                 continue
             try:
-                raw = await self.hass.async_add_executor_job(self.client.query_optional, command)
+                raw = await self.hass.async_add_executor_job(
+                    self.client.query_optional, command
+                )
                 self._optional_failures.pop(command, None)
                 if command in self._priority_optional:
                     self._priority_optional.remove(command)
@@ -790,7 +896,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 _LOGGER.debug("Optional command %s failed: %s", command, err)
                 failures += 1
                 self._optional_failures[command] = (
-                    failures, time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800)
+                    failures,
+                    time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800),
                 )
                 if command in self._priority_optional:
                     self._priority_optional.remove(command)
@@ -806,7 +913,11 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             value_map = dict(_OPTIONAL_MODE_COMMANDS)[command] or LISTENING_RAW_TO_NAME
             setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map))
         elif command in dict(_OPTIONAL_SWITCH_COMMANDS):
-            setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_switch(raw, dict(_OPTIONAL_SWITCH_COMMANDS)[command]))
+            setattr(
+                state,
+                _OPTIONAL_ATTR_MAP[command],
+                _parse_switch(raw, dict(_OPTIONAL_SWITCH_COMMANDS)[command]),
+            )
         elif command == "SLP":
             state.sleep_minutes = _parse_sleep(raw)
         elif command in _OPTIONAL_LEVEL_COMMANDS:
@@ -879,7 +990,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         try:
             await self.hass.async_add_executor_job(self.client.query, command)
         except Exception as err:
-            _LOGGER.info("%s does not respond to %s queries: %s", self.host, command, err)
+            _LOGGER.info(
+                "%s does not respond to %s queries: %s", self.host, command, err
+            )
             return False
         return True
 
@@ -895,7 +1008,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
     async def async_volume_step(self, up: bool) -> None:
         await self._async_send(self.zone.volume_command, "UP1" if up else "DOWN1")
 
-    async def async_set_volume(self, volume_level: float, max_volume: int = DEFAULT_MAX_VOLUME) -> None:
+    async def async_set_volume(
+        self, volume_level: float, max_volume: int = DEFAULT_MAX_VOLUME
+    ) -> None:
         target = max(0, min(round(volume_level * max_volume), max_volume))
         await self._async_send(self.zone.volume_command, f"{target:02X}")
 
@@ -1060,7 +1175,9 @@ def build_runtime_data(
     if skipped:
         _LOGGER.warning(
             "Skipped %d unknown source(s) for %s: %s",
-            len(skipped), host, ", ".join(sorted(skipped)),
+            len(skipped),
+            host,
+            ", ".join(sorted(skipped)),
         )
     client = OnkyoLegacyClient(host, port, retries=retries)
     entity_ids: set[str] = set()
@@ -1083,7 +1200,9 @@ def build_runtime_data(
         source_raw_to_name=main_raw_to_name,
         source_name_to_raw=main_name_to_raw,
     )
-    source_lookup = _build_source_lookup(normalized_sources, main_raw_to_name, main_name_to_raw)
+    source_lookup = _build_source_lookup(
+        normalized_sources, main_raw_to_name, main_name_to_raw
+    )
     runtime = OnkyoRuntimeData(
         title=name,
         zone_key="main",
@@ -1098,9 +1217,15 @@ def build_runtime_data(
         queryable_commands=profile.queryable_commands,
         source_lookup=source_lookup,
         supported_listening_modes=_build_select_options("LMD"),
-        supported_audio_selectors=_build_select_options("SLA") if "SLA" in profile.queryable_commands else [],
-        supported_late_night_modes=_build_select_options("LTN") if "LTN" in profile.queryable_commands else [],
-        supported_audyssey_volume_modes=_build_select_options("ADV") if "ADV" in profile.queryable_commands else [],
+        supported_audio_selectors=_build_select_options("SLA")
+        if "SLA" in profile.queryable_commands
+        else [],
+        supported_late_night_modes=_build_select_options("LTN")
+        if "LTN" in profile.queryable_commands
+        else [],
+        supported_audyssey_volume_modes=_build_select_options("ADV")
+        if "ADV" in profile.queryable_commands
+        else [],
         supported_dimmer_modes=_build_select_options("DIM"),
         entity_ids=entity_ids,
     )
@@ -1126,6 +1251,53 @@ def build_runtime_data(
     runtime.zones = (runtime,)
     runtime.candidate_zones = candidate_zones
     return runtime
+
+
+def register_dynamic_entities(
+    runtime: OnkyoRuntimeData,
+    platform: str,
+    add_entities: Callable[[list[Any]], None],
+    build_entities: Callable[[], list[Any]],
+) -> None:
+    """Register an idempotent platform callback for newly discovered support."""
+    seen = runtime.platform_unique_ids.setdefault(platform, set())
+    try:
+        from homeassistant.helpers.entity_platform import (
+            async_get_current_platform,
+            async_get_platforms,
+        )
+
+        platform_instance = async_get_current_platform()
+    except (ImportError, RuntimeError):
+        # Lightweight tests don't model HA's current-platform context.
+        platform_instance = None
+        async_get_platforms = None
+
+    def add_new_entities() -> None:
+        if runtime.stopping:
+            return
+        if platform_instance is not None and async_get_platforms is not None:
+            if platform_instance not in async_get_platforms(
+                runtime.coordinator.hass, DOMAIN
+            ):
+                if runtime.platform_adders.get(platform) is add_new_entities:
+                    runtime.platform_adders.pop(platform, None)
+                return
+        entities = []
+        new_ids = []
+        for entity in build_entities():
+            unique_id = getattr(entity, "unique_id", None) or getattr(
+                entity, "_attr_unique_id", None
+            )
+            if unique_id and unique_id not in seen:
+                entities.append(entity)
+                new_ids.append(unique_id)
+        if entities:
+            add_entities(entities)
+            seen.update(new_ids)
+
+    runtime.platform_adders[platform] = add_new_entities
+    add_new_entities()
 
 
 def _build_zone_runtime(
@@ -1239,7 +1411,9 @@ def _normalize_sources(
         normalized_alias = alias.lower()
         if normalized_alias not in source_name_to_raw:
             if strict:
-                raise UpdateFailed(f"Unsupported source alias in configuration: {alias}")
+                raise UpdateFailed(
+                    f"Unsupported source alias in configuration: {alias}"
+                )
             _LOGGER.warning("Skipping unknown source alias %r in configuration", alias)
             skipped.add(alias)
             continue

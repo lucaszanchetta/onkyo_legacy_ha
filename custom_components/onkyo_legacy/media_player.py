@@ -13,7 +13,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
+from .coordinator import (
+    OnkyoRuntimeData,
+    OnkyoZoneRuntimeData,
+    register_dynamic_entities,
+)
 
 __all__ = ["async_setup_entry"]
 
@@ -25,8 +29,11 @@ async def async_setup_entry(
 ) -> None:
     """Set up the media player from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [OnkyoLegacyMediaPlayer(zone_runtime) for zone_runtime in runtime.zones]
+    register_dynamic_entities(
+        runtime,
+        "media_player",
+        async_add_entities,
+        lambda: [OnkyoLegacyMediaPlayer(zone) for zone in runtime.zones],
     )
 
 
@@ -65,7 +72,9 @@ class OnkyoLegacyMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
     def state(self) -> MediaPlayerState | str | None:
         if not self.available:
             return None
-        return MediaPlayerState.ON if self.coordinator.data.power else MediaPlayerState.OFF
+        return (
+            MediaPlayerState.ON if self.coordinator.data.power else MediaPlayerState.OFF
+        )
 
     @property
     def volume_level(self) -> float | None:

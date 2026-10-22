@@ -12,7 +12,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
+from .coordinator import (
+    OnkyoRuntimeData,
+    OnkyoZoneRuntimeData,
+    register_dynamic_entities,
+)
 
 __all__ = ["async_setup_entry"]
 
@@ -34,18 +38,19 @@ async def async_setup_entry(
     """Set up switch entities from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[CoordinatorEntity] = []
-    for zone_runtime in runtime.zones:
-        entities.append(OnkyoLegacyPowerSwitch(zone_runtime))
-        entities.append(OnkyoLegacyMuteSwitch(zone_runtime))
-    entities.extend(
-        OnkyoLegacySpeakerSwitch(runtime, key, name, command, state_attr)
-        for key, name, command, state_attr in DESCRIPTIONS
-        if runtime.coordinator.supports(command)
-    )
+    def build_entities() -> list[CoordinatorEntity]:
+        entities: list[CoordinatorEntity] = []
+        for zone_runtime in runtime.zones:
+            entities.append(OnkyoLegacyPowerSwitch(zone_runtime))
+            entities.append(OnkyoLegacyMuteSwitch(zone_runtime))
+        entities.extend(
+            OnkyoLegacySpeakerSwitch(runtime, key, name, command, state_attr)
+            for key, name, command, state_attr in DESCRIPTIONS
+            if runtime.coordinator.supports(command)
+        )
+        return entities
 
-    if entities:
-        async_add_entities(entities)
+    register_dynamic_entities(runtime, "switch", async_add_entities, build_entities)
 
 
 class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
@@ -67,7 +72,9 @@ class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
         self._runtime = runtime
         self._command = command
         self._state_attr = state_attr
-        self._attr_name = name if runtime.zone_key == "main" else f"{runtime.zone_label} {name}"
+        self._attr_name = (
+            name if runtime.zone_key == "main" else f"{runtime.zone_label} {name}"
+        )
         self._attr_translation_key = key
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-{key}"
         self._attr_device_info = runtime.device_info
@@ -92,7 +99,11 @@ class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
     def available(self) -> bool:
         feature_supported = self.coordinator.supports(self._command)
         current_value = getattr(self.coordinator.data, self._state_attr)
-        return self.coordinator.last_update_success and feature_supported and current_value is not None
+        return (
+            self.coordinator.last_update_success
+            and feature_supported
+            and current_value is not None
+        )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if self._command.startswith("TG"):
@@ -119,7 +130,9 @@ class OnkyoLegacyPowerSwitch(CoordinatorEntity, SwitchEntity):
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
-        self._attr_name = "Power" if runtime.zone_key == "main" else f"{runtime.zone_label} Power"
+        self._attr_name = (
+            "Power" if runtime.zone_key == "main" else f"{runtime.zone_label} Power"
+        )
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-power"
         self._attr_device_info = runtime.device_info
 
@@ -154,7 +167,9 @@ class OnkyoLegacyMuteSwitch(CoordinatorEntity, SwitchEntity):
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
-        self._attr_name = "Mute" if runtime.zone_key == "main" else f"{runtime.zone_label} Mute"
+        self._attr_name = (
+            "Mute" if runtime.zone_key == "main" else f"{runtime.zone_label} Mute"
+        )
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-mute"
         self._attr_device_info = runtime.device_info
 

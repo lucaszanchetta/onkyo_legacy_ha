@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Publish core state before optional queries; schedule one bounded optional refresh task and prioritize queued controls with a fair serialized socket gate that releases during retry cooldowns.
 - Keep push state mutation on the Home Assistant loop, fan out pushes to active zones, and close clients off-loop during unload while preserving runtime after failed platform unload.
 - Validate config-flow connectivity through the same client, and route volume/dimmer services through coordinator methods.
+- Discover receiver zones and generic optional capabilities in the background; add confirmed entities dynamically, preserve inconclusive registry entries, and cancel discovery cleanly on shutdown.
 
 ## [0.3.0] - 2026-07-14
 

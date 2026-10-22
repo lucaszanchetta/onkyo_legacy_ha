@@ -39,6 +39,7 @@ from .const import (
 )
 from .coordinator import (
     ZONE_DEFINITIONS,
+    CommandResponseTimeout,
     OnkyoRuntimeData,
     OnkyoZoneRuntimeData,
     build_runtime_data,
@@ -150,8 +151,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         host=entry.data[CONF_HOST],
         port=entry.data[CONF_PORT],
-        name=entry.data.get(CONF_NAME)
-        or profile.default_name,
+        name=entry.data.get(CONF_NAME) or profile.default_name,
         model=model,
         scan_interval=entry.data[CONF_SCAN_INTERVAL],
         sources=entry.data.get(CONF_SOURCES) or profile.default_sources,
@@ -159,38 +159,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         retries=entry.data.get(CONF_RETRIES, DEFAULT_RETRIES),
         strict_sources=entry.data.get(CONF_STRICT_SOURCES, DEFAULT_STRICT_SOURCES),
     )
+    runtime.model = model
+    runtime.stopping = False
+    runtime.platform_adders = getattr(runtime, "platform_adders", {})
+    runtime.platform_unique_ids = getattr(runtime, "platform_unique_ids", {})
     hass.data[DOMAIN][entry.entry_id] = runtime
     try:
         if model in PROFILES:
             # Known model — trust the hard-coded command list.
             for command in runtime.queryable_commands:
                 runtime.coordinator.set_command_capability(command, True)
-        else:
-            # Standby silence is not evidence that a command is unsupported.
-            try:
-                power = await hass.async_add_executor_job(
-                    runtime.coordinator.client.query_optional, "PWR", 1.5
-                )
-                if power.endswith("01"):
-                    results: dict[str, bool] = await hass.async_add_executor_job(
-                        runtime.coordinator.client.probe_commands,
-                        runtime.queryable_commands,
-                    )
-                else:
-                    results = {command: True for command in runtime.queryable_commands}
-                for command in runtime.queryable_commands:
-                    runtime.coordinator.set_command_capability(
-                        command, results.get(command, True)
-                    )
-            except (OSError, TimeoutError, ConnectionError) as err:
-                _LOGGER.warning(
-                    "Startup probe failed for %s:%s, using all commands as fallback: %s",
-                    runtime.host, runtime.port, err,
-                )
-                for command in runtime.queryable_commands:
-                    runtime.coordinator.set_command_capability(command, True)
-
-        runtime.zones = await _async_detect_supported_zones(runtime)
+        # Unknown zones and generic capabilities remain pending until the
+        # background discovery loop can query them without delaying setup.
+        runtime.zones = (runtime,)
+        runtime.discovery_states = {
+            zone.zone_key: "pending" for zone in runtime.candidate_zones
+        }
         _propagate_zone_command_capabilities(runtime)
         runtime.initial_refresh_task = hass.async_create_task(
             _async_initial_refresh(runtime)
@@ -205,6 +189,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _async_remove_unsupported_zone_registry_entries(hass, runtime)
         await _async_remove_stale_entity_registry_entries(hass, runtime.host)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        _start_discovery_task(hass, runtime)
+
         async def _async_homeassistant_stop(_event) -> None:
             await _disconnect_all(hass)
 
@@ -233,9 +219,12 @@ async def _async_initial_refresh(runtime: OnkyoRuntimeData) -> None:
         )
 
 
-async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData) -> None:
+async def _async_cleanup_runtime(
+    hass: HomeAssistant, runtime: OnkyoRuntimeData
+) -> None:
     """Finish listener, refresh-task, and socket cleanup despite cancellation."""
     client = runtime.coordinator.client
+    runtime.stopping = True
     client.begin_close()
     zone_runtimes = getattr(runtime, "zones", ()) or (runtime,)
     for zone_runtime in zone_runtimes:
@@ -249,6 +238,10 @@ async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData)
         if initial_task:
             initial_task.cancel()
             await asyncio.gather(initial_task, return_exceptions=True)
+        discovery_task = getattr(runtime, "discovery_task", None)
+        if discovery_task:
+            discovery_task.cancel()
+            await asyncio.gather(discovery_task, return_exceptions=True)
         for zone_runtime in zone_runtimes:
             cancel_optional = getattr(
                 zone_runtime.coordinator, "async_cancel_optional_refresh", None
@@ -269,26 +262,167 @@ async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData)
         raise asyncio.CancelledError
 
 
-async def _async_detect_supported_zones(
-    runtime: OnkyoRuntimeData,
-) -> tuple[OnkyoRuntimeData | OnkyoZoneRuntimeData, ...]:
-    zones: list[OnkyoRuntimeData | OnkyoZoneRuntimeData] = [runtime]
-    for zone_runtime in runtime.candidate_zones:
-        try:
-            await zone_runtime.coordinator.hass.async_add_executor_job(
-                zone_runtime.coordinator._query_core_state
+async def _async_discovery_loop(runtime: OnkyoRuntimeData) -> None:
+    """Discover zone presence and generic commands without blocking setup."""
+    zone_cursor = 0
+    generic_commands = tuple(
+        command
+        for command in runtime.queryable_commands
+        if command not in {"PWR", "MVL", "AMT", "SLI"}
+    )
+    try:
+        while not getattr(runtime, "stopping", False):
+            capabilities = getattr(runtime.coordinator, "command_capabilities", {})
+            candidates = tuple(
+                zone
+                for zone in runtime.candidate_zones
+                if runtime.discovery_states.get(zone.zone_key)
+                not in {"supported", "unsupported"}
             )
-        except (OSError, TimeoutError, ConnectionError, ValueError) as err:
-            _LOGGER.info(
-                "Skipping %s on %s:%s because core queries failed: %s",
-                zone_runtime.zone_label,
-                zone_runtime.host,
-                zone_runtime.port,
-                err,
+            generic_pending = tuple(
+                command
+                for command in generic_commands
+                if command not in capabilities
             )
-            continue
-        zones.append(zone_runtime)
-    return tuple(zones)
+            if not candidates and not generic_pending:
+                return
+
+            cooldown = runtime.coordinator.client.cooldown_remaining()
+            if cooldown > 0:
+                await asyncio.sleep(cooldown)
+                continue
+
+            if candidates:
+                zone_cursor %= len(candidates)
+                zone = candidates[zone_cursor]
+                try:
+                    command = zone.coordinator.zone.power_command
+                    response = await runtime.coordinator.hass.async_add_executor_job(
+                        runtime.coordinator.client.query_optional, command, 1.5
+                    )
+                    if runtime.stopping:
+                        return
+                    if response.startswith(command) and response[len(command) :] in {
+                        "00",
+                        "01",
+                    }:
+                        runtime.discovery_states[zone.zone_key] = "supported"
+                        if all(item.zone_key != zone.zone_key for item in runtime.zones):
+                            runtime.zones += (zone,)
+                            _propagate_zone_command_capabilities(runtime)
+                            _notify_dynamic_entities(runtime)
+                    else:
+                        runtime.discovery_states[zone.zone_key] = "inconclusive"
+                except CommandResponseTimeout:
+                    if runtime.stopping:
+                        return
+                    if (
+                        runtime.coordinator.core_power_is_fresh
+                        and runtime.coordinator.data.power
+                    ):
+                        count = runtime.discovery_timeouts.get(zone.zone_key, 0) + 1
+                        runtime.discovery_timeouts[zone.zone_key] = count
+                        runtime.discovery_states[zone.zone_key] = (
+                            "unsupported" if count >= 2 else "pending"
+                        )
+                        if count >= 2:
+                            await _async_remove_unsupported_zone_registry_entries(
+                                runtime.coordinator.hass, runtime
+                            )
+                    else:
+                        runtime.discovery_states[zone.zone_key] = "inconclusive"
+                except (OSError, ConnectionError, TimeoutError, ValueError) as err:
+                    if runtime.stopping:
+                        return
+                    runtime.discovery_states[zone.zone_key] = "inconclusive"
+                    _LOGGER.debug(
+                        "Zone discovery for %s was inconclusive: %s", zone.zone_key, err
+                    )
+                finally:
+                    zone_cursor = (zone_cursor + 1) % max(
+                        1, len(runtime.candidate_zones)
+                    )
+
+            cooldown = runtime.coordinator.client.cooldown_remaining()
+            if cooldown > 0:
+                await asyncio.sleep(cooldown)
+                continue
+
+            if (
+                runtime.model not in PROFILES
+                and runtime.coordinator.core_power_is_fresh
+                and runtime.coordinator.data.power
+            ):
+                pending_commands = [
+                    generic_commands[(getattr(runtime, "capability_cursor", 0) + offset) % len(generic_commands)]
+                    for offset in range(len(generic_commands))
+                    if generic_commands[(getattr(runtime, "capability_cursor", 0) + offset) % len(generic_commands)]
+                    not in capabilities
+                ][:2]
+                for command in pending_commands:
+                    if runtime.stopping:
+                        return
+                    pause_for_cooldown = False
+                    try:
+                        await runtime.coordinator.hass.async_add_executor_job(
+                            runtime.coordinator.client.query_optional, command, 1.5
+                        )
+                    except CommandResponseTimeout:
+                        if runtime.stopping:
+                            return
+                        if (
+                            runtime.coordinator.core_power_is_fresh
+                            and runtime.coordinator.data.power
+                        ):
+                            count = runtime.capability_timeouts.get(command, 0) + 1
+                            runtime.capability_timeouts[command] = count
+                            if count >= 2:
+                                runtime.coordinator.set_command_capability(
+                                    command, False
+                                )
+                    except (OSError, ConnectionError, TimeoutError, ValueError):
+                        pass
+                    else:
+                        if runtime.stopping:
+                            return
+                        runtime.coordinator.set_command_capability(command, True)
+                        _propagate_zone_command_capabilities(runtime)
+                        runtime.coordinator._start_optional_refresh()
+                        _notify_dynamic_entities(runtime)
+                    finally:
+                        runtime.capability_cursor = (
+                            generic_commands.index(command) + 1
+                        ) % max(1, len(generic_commands))
+                        pause_for_cooldown = (
+                            runtime.coordinator.client.cooldown_remaining() > 0
+                        )
+                    if pause_for_cooldown:
+                        break
+            cooldown = runtime.coordinator.client.cooldown_remaining()
+            if cooldown > 0:
+                await asyncio.sleep(cooldown)
+                continue
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        raise
+
+
+def _notify_dynamic_entities(runtime: OnkyoRuntimeData) -> None:
+    """Refresh registered platform factories after discovery changes."""
+    if runtime.stopping:
+        return
+    for add_entities in tuple(runtime.platform_adders.values()):
+        add_entities()
+
+
+def _start_discovery_task(hass: HomeAssistant, runtime: OnkyoRuntimeData) -> None:
+    """Start discovery once when the runtime is active."""
+    task = getattr(runtime, "discovery_task", None)
+    if runtime.stopping or (task is not None and not task.done()):
+        return
+    runtime.discovery_task = hass.async_create_background_task(
+        _async_discovery_loop(runtime), name=f"Onkyo discovery {runtime.host}"
+    )
 
 
 def _propagate_zone_command_capabilities(runtime: OnkyoRuntimeData) -> None:
@@ -306,8 +440,19 @@ def _propagate_zone_command_capabilities(runtime: OnkyoRuntimeData) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload an Onkyo config entry."""
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime is not None:
+        runtime.stopping = True
+        discovery_task = getattr(runtime, "discovery_task", None)
+        if discovery_task is not None and not discovery_task.done():
+            discovery_task.cancel()
+            await asyncio.gather(discovery_task, return_exceptions=True)
+        runtime.discovery_task = None
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unload_ok:
+        if runtime is not None:
+            runtime.stopping = False
+            _start_discovery_task(hass, runtime)
         return False
     runtime = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if runtime is not None:
@@ -363,9 +508,7 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         volume = call.data["volume"]
         zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
         max_volume = getattr(zone_runtime, "max_volume", DEFAULT_MAX_VOLUME)
-        await zone_runtime.coordinator.async_set_volume(
-            volume / max_volume, max_volume
-        )
+        await zone_runtime.coordinator.async_set_volume(volume / max_volume, max_volume)
 
     async def async_handle_set_dimmer(call: ServiceCall) -> None:
         zone_runtime = _resolve_zone_runtime(hass, call.data.get(CONF_ENTITY_ID))
@@ -376,28 +519,36 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN,
         SERVICE_SET_SOURCE,
         async_handle_set_source,
-        schema=vol.Schema({
-            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
-            vol.Required("source"): cv.string,
-        }),
+        schema=vol.Schema(
+            {
+                vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+                vol.Required("source"): cv.string,
+            }
+        ),
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_VOLUME,
         async_handle_set_volume,
-        schema=vol.Schema({
-            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
-            vol.Required("volume"): vol.All(vol.Coerce(int), vol.Range(min=0, max=200)),
-        }),
+        schema=vol.Schema(
+            {
+                vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+                vol.Required("volume"): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=200)
+                ),
+            }
+        ),
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_DIMMER,
         async_handle_set_dimmer,
-        schema=vol.Schema({
-            vol.Optional(CONF_ENTITY_ID): cv.entity_id,
-            vol.Required("level"): cv.string,
-        }),
+        schema=vol.Schema(
+            {
+                vol.Optional(CONF_ENTITY_ID): cv.entity_id,
+                vol.Required("level"): cv.string,
+            }
+        ),
     )
 
 
@@ -412,7 +563,9 @@ def _resolve_runtime(hass: HomeAssistant, entity_id: str | None) -> OnkyoRuntime
     if len(runtimes) == 1:
         return next(iter(runtimes.values()))
 
-    raise vol.Invalid("entity_id is required when multiple Onkyo Legacy devices are configured")
+    raise vol.Invalid(
+        "entity_id is required when multiple Onkyo Legacy devices are configured"
+    )
 
 
 def _resolve_zone_runtime(
@@ -441,18 +594,7 @@ def _resolve_zone_runtime(
 async def _disconnect_all(hass: HomeAssistant) -> None:
     runtimes = tuple(hass.data.get(DOMAIN, {}).values())
     for runtime in runtimes:
-        client = runtime.coordinator.client
-        client.begin_close()
-        zone_runtimes = getattr(runtime, "zones", ()) or (runtime,)
-        for zone_runtime in zone_runtimes:
-            zone_runtime.coordinator._closing = True
-        for zone_runtime in zone_runtimes:
-            cancel_optional = getattr(
-                zone_runtime.coordinator, "async_cancel_optional_refresh", None
-            )
-            if cancel_optional is not None:
-                await cancel_optional()
-        await hass.async_add_executor_job(client.close)
+        await _async_cleanup_runtime(hass, runtime)
 
 
 async def _async_migrate_main_entity_unique_ids(hass: HomeAssistant, host: str) -> None:
@@ -462,25 +604,39 @@ async def _async_migrate_main_entity_unique_ids(hass: HomeAssistant, host: str) 
     for platform, current_suffix, legacy_suffix in MAIN_ENTITY_UNIQUE_ID_MIGRATIONS:
         current_unique_id = f"{host}-{current_suffix}"
         legacy_unique_id = f"{host}-{legacy_suffix}"
-        current_entity_id = registry.async_get_entity_id(platform, DOMAIN, current_unique_id)
-        legacy_entity_id = registry.async_get_entity_id(platform, DOMAIN, legacy_unique_id)
+        current_entity_id = registry.async_get_entity_id(
+            platform, DOMAIN, current_unique_id
+        )
+        legacy_entity_id = registry.async_get_entity_id(
+            platform, DOMAIN, legacy_unique_id
+        )
 
         if current_entity_id and legacy_entity_id:
             registry.async_remove(legacy_entity_id)
             continue
 
         if legacy_entity_id and not current_entity_id:
-            registry.async_update_entity(legacy_entity_id, new_unique_id=current_unique_id)
-            current_entity_id = registry.async_get_entity_id(platform, DOMAIN, current_unique_id)
+            registry.async_update_entity(
+                legacy_entity_id, new_unique_id=current_unique_id
+            )
+            current_entity_id = registry.async_get_entity_id(
+                platform, DOMAIN, current_unique_id
+            )
         else:
-            current_entity_id = registry.async_get_entity_id(platform, DOMAIN, current_unique_id)
+            current_entity_id = registry.async_get_entity_id(
+                platform, DOMAIN, current_unique_id
+            )
 
         if current_entity_id and current_entity_id.endswith("_2"):
             desired_entity_id = current_entity_id[:-2]
-            _async_update_entity_id_if_available(registry, current_entity_id, desired_entity_id)
+            _async_update_entity_id_if_available(
+                registry, current_entity_id, desired_entity_id
+            )
 
 
-async def _async_remove_stale_entity_registry_entries(hass: HomeAssistant, host: str) -> None:
+async def _async_remove_stale_entity_registry_entries(
+    hass: HomeAssistant, host: str
+) -> None:
     from homeassistant.helpers import entity_registry as er
 
     registry = er.async_get(hass)
@@ -499,8 +655,13 @@ async def _async_remove_unsupported_zone_registry_entries(
 
     registry = er.async_get(hass)
     active_zone_keys = {zone_runtime.zone_key for zone_runtime in runtime.zones}
+    pending_zone_keys = {
+        zone_key
+        for zone_key, state in getattr(runtime, "discovery_states", {}).items()
+        if state in {"pending", "inconclusive"}
+    }
     for zone_key, entries in ZONE_ENTITY_UNIQUE_ID_SUFFIXES.items():
-        if zone_key in active_zone_keys:
+        if zone_key in active_zone_keys or zone_key in pending_zone_keys:
             continue
         for platform, suffix in entries:
             unique_id = f"{runtime.host}-{suffix}"
@@ -509,7 +670,9 @@ async def _async_remove_unsupported_zone_registry_entries(
                 registry.async_remove(entity_id)
 
 
-def _async_update_entity_id_if_available(registry: object, current_entity_id: str, desired_entity_id: str) -> None:
+def _async_update_entity_id_if_available(
+    registry: object, current_entity_id: str, desired_entity_id: str
+) -> None:
     async_get = getattr(registry, "async_get", None)
     if callable(async_get) and async_get(desired_entity_id) is not None:
         return

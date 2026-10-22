@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import unittest
+import sys
 
 from tests.helpers import FakeHass, fresh_import
 
 
 class EntityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.coordinator_module = fresh_import("custom_components.onkyo_legacy.coordinator")
-        self.media_player_module = fresh_import("custom_components.onkyo_legacy.media_player")
+        self.coordinator_module = fresh_import(
+            "custom_components.onkyo_legacy.coordinator"
+        )
+        self.media_player_module = fresh_import(
+            "custom_components.onkyo_legacy.media_player"
+        )
         self.select_module = fresh_import("custom_components.onkyo_legacy.select")
         self.switch_module = fresh_import("custom_components.onkyo_legacy.switch")
         self.number_module = fresh_import("custom_components.onkyo_legacy.number")
@@ -108,7 +113,9 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             runtime.coordinator.set_command_capability(command, True)
         return runtime
 
-    async def test_media_player_uses_shared_device_info_and_source_mapping(self) -> None:
+    async def test_media_player_uses_shared_device_info_and_source_mapping(
+        self,
+    ) -> None:
         runtime = self._runtime()
         entity = self.media_player_module.OnkyoLegacyMediaPlayer(runtime)
         entity.entity_id = "media_player.onkyo_pr_sc5507"
@@ -190,7 +197,9 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("plii", entity.options)
         self.assertNotIn("query", entity.options)
 
-    async def test_switch_setup_creates_binary_controls_for_supported_commands(self) -> None:
+    async def test_switch_setup_creates_binary_controls_for_supported_commands(
+        self,
+    ) -> None:
         runtime = self._runtime()
         self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
         entities: list[object] = []
@@ -288,10 +297,18 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
 
             return _capture
 
-        await self.select_module.async_setup_entry(self.hass, entry, capture(select_entities))
-        await self.number_module.async_setup_entry(self.hass, entry, capture(number_entities))
-        await self.switch_module.async_setup_entry(self.hass, entry, capture(switch_entities))
-        await self.sensor_module.async_setup_entry(self.hass, entry, capture(sensor_entities))
+        await self.select_module.async_setup_entry(
+            self.hass, entry, capture(select_entities)
+        )
+        await self.number_module.async_setup_entry(
+            self.hass, entry, capture(number_entities)
+        )
+        await self.switch_module.async_setup_entry(
+            self.hass, entry, capture(switch_entities)
+        )
+        await self.sensor_module.async_setup_entry(
+            self.hass, entry, capture(sensor_entities)
+        )
 
         self.assertEqual(
             {entity._attr_name for entity in select_entities},
@@ -301,8 +318,116 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             {entity._attr_name for entity in number_entities},
             {"Volume Level", "Sleep Timer"},
         )
-        self.assertEqual({entity._attr_name for entity in switch_entities}, {"Power", "Mute"})
-        self.assertEqual({entity._attr_name for entity in sensor_entities}, {"Tuner Frequency"})
+        self.assertEqual(
+            {entity._attr_name for entity in switch_entities}, {"Power", "Mute"}
+        )
+        self.assertEqual(
+            {entity._attr_name for entity in sensor_entities}, {"Tuner Frequency"}
+        )
+
+    async def test_platform_callbacks_add_new_zone_and_capability_entities_once(
+        self,
+    ) -> None:
+        runtime = self._runtime()
+        runtime.coordinator.set_command_capability("IFA", False)
+        self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
+        entry = type("Entry", (), {"entry_id": "entry-1", "data": {}})()
+        added: dict[str, list[object]] = {
+            key: []
+            for key in (
+                "media_player",
+                "number",
+                "select",
+                "switch",
+                "sensor",
+            )
+        }
+
+        def capture(platform: str):
+            return lambda entities: added[platform].extend(entities)
+
+        await self.media_player_module.async_setup_entry(
+            self.hass, entry, capture("media_player")
+        )
+        await self.number_module.async_setup_entry(self.hass, entry, capture("number"))
+        await self.select_module.async_setup_entry(self.hass, entry, capture("select"))
+        await self.switch_module.async_setup_entry(self.hass, entry, capture("switch"))
+        await self.sensor_module.async_setup_entry(self.hass, entry, capture("sensor"))
+
+        zone2 = runtime.candidate_zones[0]
+        runtime.coordinator.set_command_capability("LMD", True)
+        runtime.zones += (zone2,)
+        runtime.coordinator.set_command_capability("IFA", True)
+        self.init_notify_dynamic_entities(runtime)
+        self.init_notify_dynamic_entities(runtime)
+
+        for entities in added.values():
+            unique_ids = [entity._attr_unique_id for entity in entities]
+            self.assertEqual(len(unique_ids), len(set(unique_ids)))
+        self.assertIn(
+            "192.168.1.23-zone2",
+            [entity._attr_unique_id for entity in added["media_player"]],
+        )
+        self.assertIn(
+            "192.168.1.23-zone2-volume-level",
+            [entity._attr_unique_id for entity in added["number"]],
+        )
+        self.assertIn(
+            "192.168.1.23-zone2-source",
+            [entity._attr_unique_id for entity in added["select"]],
+        )
+        self.assertIn(
+            "192.168.1.23-zone2-power",
+            [entity._attr_unique_id for entity in added["switch"]],
+        )
+        self.assertIn(
+            "192.168.1.23-audio_input_terminal",
+            [entity._attr_unique_id for entity in added["sensor"]],
+        )
+
+    def init_notify_dynamic_entities(self, runtime) -> None:
+        module = fresh_import("custom_components.onkyo_legacy")
+        module._notify_dynamic_entities(runtime)
+
+    async def test_failed_partial_unload_resumes_only_still_loaded_platforms(self) -> None:
+        entity_platform = sys.modules["homeassistant.helpers.entity_platform"]
+        first_platform = object()
+        second_platform = object()
+        current = [first_platform]
+        entity_platform.async_get_current_platform = lambda: current[0]
+        entity_platform.async_get_platforms = lambda _hass, _domain: list(current)
+
+        runtime = self._runtime()
+        added = {"media_player": [], "sensor": []}
+        enabled = {"media_player": False, "sensor": False}
+
+        def build(platform: str):
+            return (
+                [type("Entity", (), {"_attr_unique_id": f"dynamic-{platform}"})()]
+                if enabled[platform]
+                else []
+            )
+
+        self.coordinator_module.register_dynamic_entities(
+            runtime, "media_player", added["media_player"].extend,
+            lambda: build("media_player"),
+        )
+        current[0] = second_platform
+        self.coordinator_module.register_dynamic_entities(
+            runtime, "sensor", added["sensor"].extend,
+            lambda: build("sensor"),
+        )
+        current[:] = [second_platform]
+        enabled.update(media_player=True, sensor=True)
+
+        # A failed config-entry unload resumes discovery. The unloaded platform
+        # callback removes itself when invoked; the surviving one still adds.
+        runtime.stopping = False
+        self.init_notify_dynamic_entities(runtime)
+
+        self.assertEqual(added["media_player"], [])
+        self.assertEqual(len(added["sensor"]), 1)
+        self.assertNotIn("media_player", runtime.platform_adders)
 
     async def test_tx8050_media_player_uses_receiver_source_names(self) -> None:
         runtime = self._tx8050_runtime()
@@ -379,7 +504,9 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(entity.native_value, 10710)
 
-    async def test_tuner_sensor_native_value_returns_none_when_no_frequency(self) -> None:
+    async def test_tuner_sensor_native_value_returns_none_when_no_frequency(
+        self,
+    ) -> None:
         runtime = self._tx8050_runtime()
         runtime.coordinator.data = self.coordinator_module.OnkyoState(
             power=True,

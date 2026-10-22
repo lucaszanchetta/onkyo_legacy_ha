@@ -10,7 +10,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
+from .coordinator import (
+    OnkyoRuntimeData,
+    OnkyoZoneRuntimeData,
+    register_dynamic_entities,
+)
 
 __all__ = ["async_setup_entry"]
 
@@ -22,27 +26,33 @@ async def async_setup_entry(
 ) -> None:
     """Set up select entities from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
-    entities: list[CoordinatorEntity] = []
-    for zone_runtime in runtime.zones:
-        if zone_runtime.sources:
-            entities.append(OnkyoLegacySourceSelect(zone_runtime))
-        if zone_runtime.zone_key != "main" and zone_runtime.coordinator.supports("LMD"):
-            entities.append(
-                OnkyoLegacyListeningModeSelect(zone_runtime, supported_modes=runtime.supported_listening_modes)
-            )
-    if runtime.coordinator.supports("LMD"):
-        entities.append(OnkyoLegacyListeningModeSelect(runtime))
-    if runtime.coordinator.supports("DIM"):
-        entities.append(OnkyoLegacyDimmerSelect(runtime))
-    if runtime.coordinator.supports("SLA"):
-        entities.append(OnkyoLegacyAudioSelectorSelect(runtime))
-    if runtime.coordinator.supports("LTN"):
-        entities.append(OnkyoLegacyLateNightSelect(runtime))
-    if runtime.coordinator.supports("ADV"):
-        entities.append(OnkyoLegacyAudysseyDynamicVolumeSelect(runtime))
 
-    if entities:
-        async_add_entities(entities)
+    def build_entities() -> list[CoordinatorEntity]:
+        entities: list[CoordinatorEntity] = []
+        for zone_runtime in runtime.zones:
+            if zone_runtime.sources:
+                entities.append(OnkyoLegacySourceSelect(zone_runtime))
+            if zone_runtime.zone_key != "main" and zone_runtime.coordinator.supports(
+                "LMD"
+            ):
+                entities.append(
+                    OnkyoLegacyListeningModeSelect(
+                        zone_runtime, supported_modes=runtime.supported_listening_modes
+                    )
+                )
+        if runtime.coordinator.supports("LMD"):
+            entities.append(OnkyoLegacyListeningModeSelect(runtime))
+        if runtime.coordinator.supports("DIM"):
+            entities.append(OnkyoLegacyDimmerSelect(runtime))
+        if runtime.coordinator.supports("SLA"):
+            entities.append(OnkyoLegacyAudioSelectorSelect(runtime))
+        if runtime.coordinator.supports("LTN"):
+            entities.append(OnkyoLegacyLateNightSelect(runtime))
+        if runtime.coordinator.supports("ADV"):
+            entities.append(OnkyoLegacyAudysseyDynamicVolumeSelect(runtime))
+        return entities
+
+    register_dynamic_entities(runtime, "select", async_add_entities, build_entities)
 
 
 class OnkyoLegacySourceSelect(CoordinatorEntity, SelectEntity):
@@ -57,7 +67,9 @@ class OnkyoLegacySourceSelect(CoordinatorEntity, SelectEntity):
     def __init__(self, runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
-        self._attr_name = "Source" if runtime.zone_key == "main" else f"{runtime.zone_label} Source"
+        self._attr_name = (
+            "Source" if runtime.zone_key == "main" else f"{runtime.zone_label} Source"
+        )
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-source"
         self._attr_device_info = runtime.device_info
 
@@ -249,7 +261,9 @@ class OnkyoLegacyAudysseyDynamicVolumeSelect(CoordinatorEntity, SelectEntity):
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
-        self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-audyssey-dynamic-volume"
+        self._attr_unique_id = (
+            f"{runtime.host}-{runtime.zone_key}-audyssey-dynamic-volume"
+        )
         self._attr_options = runtime.supported_audyssey_volume_modes
         self._attr_device_info = runtime.device_info
 

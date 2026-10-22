@@ -38,11 +38,11 @@ This integration works with any receiver that supports **eISCP over TCP port 601
 
 ### Generic Model Support
 
-Any unlisted eISCP receiver uses the **GENERIC** profile. It probes optional commands at startup only when a power query reports the receiver is on. At standby startup, optional capabilities remain provisional; while powered on, optional commands are checked two at a time with per-command retry suppression. Those runtime checks preserve polling health but do not change the displayed capability list until setup runs again. This means:
+Any unlisted eISCP receiver uses the **GENERIC** profile. Setup exposes core controls immediately and starts discovery in the background. Optional commands are checked at most two per discovery round, and only after a core refresh confirms the receiver is on; two command-specific response timeouts mark a command unsupported, while connection and cooldown errors remain inconclusive. Confirmed capabilities add their entities without a reload. Zone discovery probes only the zone power command, treats either `00` or `01` as evidence of support, rotates across candidates after inconclusive results, and adds supported-zone entities as soon as found. Pending and inconclusive zones retain their registry entries. This means:
 
 - Core controls (power, volume, mute, source) work on virtually all eISCP receivers
 - Optional controls (listening mode, dimmer, sleep timer, etc.) are auto-detected while powered on
-- Zone 2/3 support is detected at startup
+- Zone 2/3 and generic optional capabilities are discovered after setup without delaying startup
 - No manual configuration needed — just enter the IP address
 
 To check what your receiver supports before installing, use the included smoke test tool:
@@ -218,6 +218,20 @@ Validate receiver capabilities before expanding the entity surface:
 # Unknown receiver with discovery
 ./.venv/bin/python scripts/prsc5507_smoke.py --host 192.168.1.186 --model TX-NR801 --timeout 15 --discover
 ```
+
+### Startup Timing Simulation
+
+The startup regression test measures setup with ten simulated optional commands
+and blocks the first optional response. It verifies setup returns before that
+response is released; this is a deterministic simulator result, not a live
+receiver benchmark. Reproduce the measurement with:
+
+```bash
+ONKYO_REPORT_SETUP_TIMING=1 ./.venv/bin/python -m pytest -q -s tests/test_integration.py -k setup_returns_while_discovery_query_is_silent_and_unload_cancels_it
+```
+
+In the recorded run, setup returned in 2.238 ms while all ten optional
+commands remained unresolved and the first response was blocked.
 
 ### Project Structure
 

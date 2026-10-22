@@ -12,7 +12,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData
+from .coordinator import (
+    OnkyoRuntimeData,
+    register_dynamic_entities,
+)
 
 __all__ = ["async_setup_entry"]
 
@@ -121,19 +124,22 @@ async def async_setup_entry(
 ) -> None:
     """Set up diagnostic sensors from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
-    entities = []
-    for description in SENSOR_DESCRIPTIONS:
-        command = description.command
-        if not command:
-            command = "IFA" if description.data_attr == "audio_information" else "IFV"
-        if runtime.coordinator.supports(command):
-            entities.append(OnkyoLegacyDiagnosticSensor(runtime, description))
 
-    if runtime.coordinator.supports("TUN"):
-        entities.append(OnkyoLegacyTunerSensor(runtime))
+    def build_entities() -> list[CoordinatorEntity]:
+        entities = []
+        for description in SENSOR_DESCRIPTIONS:
+            command = description.command
+            if not command:
+                command = (
+                    "IFA" if description.data_attr == "audio_information" else "IFV"
+                )
+            if runtime.coordinator.supports(command):
+                entities.append(OnkyoLegacyDiagnosticSensor(runtime, description))
+        if runtime.coordinator.supports("TUN"):
+            entities.append(OnkyoLegacyTunerSensor(runtime))
+        return entities
 
-    if entities:
-        async_add_entities(entities)
+    register_dynamic_entities(runtime, "sensor", async_add_entities, build_entities)
 
 
 class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
@@ -170,8 +176,14 @@ class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
     def available(self) -> bool:
         command = self.entity_description.command
         if not command:
-            command = "IFA" if self.entity_description.data_attr == "audio_information" else "IFV"
-        return self.coordinator.last_update_success and self.coordinator.supports(command)
+            command = (
+                "IFA"
+                if self.entity_description.data_attr == "audio_information"
+                else "IFV"
+            )
+        return self.coordinator.last_update_success and self.coordinator.supports(
+            command
+        )
 
 
 class OnkyoLegacyTunerSensor(CoordinatorEntity, SensorEntity):

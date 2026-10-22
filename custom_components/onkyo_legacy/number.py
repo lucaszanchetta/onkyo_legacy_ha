@@ -12,7 +12,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .coordinator import OnkyoRuntimeData, OnkyoZoneRuntimeData
+from .coordinator import (
+    OnkyoRuntimeData,
+    OnkyoZoneRuntimeData,
+    register_dynamic_entities,
+)
 
 __all__ = ["async_setup_entry"]
 
@@ -30,8 +34,18 @@ class NumberDescription:
 
 DESCRIPTIONS = (
     NumberDescription("sleep-timer", "Sleep Timer", "SLP", "sleep_minutes", 0, 90, 1),
-    NumberDescription("center-level", "Center Temporary Level", "CTL", "center_level", -12, 12, 1),
-    NumberDescription("subwoofer-level", "Subwoofer Temporary Level", "SWL", "subwoofer_level", -15, 12, 1),
+    NumberDescription(
+        "center-level", "Center Temporary Level", "CTL", "center_level", -12, 12, 1
+    ),
+    NumberDescription(
+        "subwoofer-level",
+        "Subwoofer Temporary Level",
+        "SWL",
+        "subwoofer_level",
+        -15,
+        12,
+        1,
+    ),
 )
 
 
@@ -42,14 +56,17 @@ async def async_setup_entry(
 ) -> None:
     """Set up number entities from a config entry."""
     runtime: OnkyoRuntimeData = hass.data[DOMAIN][entry.entry_id]
-    entities = [
-        OnkyoLegacyNumber(runtime, description)
-        for description in DESCRIPTIONS
-        if runtime.coordinator.supports(description.command)
-    ]
-    entities = [OnkyoLegacyVolumeNumber(zone_runtime) for zone_runtime in runtime.zones] + entities
-    if entities:
-        async_add_entities(entities)
+
+    def build_entities() -> list[CoordinatorEntity]:
+        entities: list[CoordinatorEntity] = [
+            OnkyoLegacyNumber(runtime, description)
+            for description in DESCRIPTIONS
+            if runtime.coordinator.supports(description.command)
+        ]
+        entities.extend(OnkyoLegacyVolumeNumber(zone) for zone in runtime.zones)
+        return entities
+
+    register_dynamic_entities(runtime, "number", async_add_entities, build_entities)
 
 
 class OnkyoLegacyNumber(CoordinatorEntity, NumberEntity):
@@ -58,7 +75,9 @@ class OnkyoLegacyNumber(CoordinatorEntity, NumberEntity):
     _attr_has_entity_name = True
     _attr_mode = NumberMode.BOX
 
-    def __init__(self, runtime: OnkyoRuntimeData, description: NumberDescription) -> None:
+    def __init__(
+        self, runtime: OnkyoRuntimeData, description: NumberDescription
+    ) -> None:
         super().__init__(runtime.coordinator)
         self._runtime = runtime
         self._description = description
@@ -87,9 +106,11 @@ class OnkyoLegacyNumber(CoordinatorEntity, NumberEntity):
     @property
     def available(self) -> bool:
         value = getattr(self.coordinator.data, self._description.state_attr)
-        return self.coordinator.last_update_success and self.coordinator.supports(
-            self._description.command
-        ) and value is not None
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.supports(self._description.command)
+            and value is not None
+        )
 
     async def async_set_native_value(self, value: float) -> None:
         native_value = int(round(value))
@@ -113,7 +134,9 @@ class OnkyoLegacyVolumeNumber(CoordinatorEntity, NumberEntity):
         super().__init__(runtime.coordinator)
         self._runtime = runtime
         self._attr_name = (
-            "Volume Level" if runtime.zone_key == "main" else f"{runtime.zone_label} Volume Level"
+            "Volume Level"
+            if runtime.zone_key == "main"
+            else f"{runtime.zone_label} Volume Level"
         )
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-volume-level"
         self._attr_native_min_value = 0
@@ -132,7 +155,12 @@ class OnkyoLegacyVolumeNumber(CoordinatorEntity, NumberEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.last_update_success and self.coordinator.data.volume is not None
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.data.volume is not None
+        )
 
     async def async_set_native_value(self, value: float) -> None:
-        await self.coordinator.async_set_volume(value / self._runtime.max_volume, self._runtime.max_volume)
+        await self.coordinator.async_set_volume(
+            value / self._runtime.max_volume, self._runtime.max_volume
+        )
