@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serialize listener reads and command queries through one framed socket reader; preserve unsolicited updates received during a query and reset connections on partial frames or EOF.
 - Share a capped exponential reconnect cooldown across listener, queries, batches, and probes; send-only writes are not retried.
 - Poll core state before optional commands, limit optional polling to powered-on receivers, and back off independently for silent optional commands.
+- Publish core state before optional queries; schedule one bounded optional refresh task and prioritize queued controls with a fair serialized socket gate that releases during retry cooldowns.
 - Keep push state mutation on the Home Assistant loop, fan out pushes to active zones, and close clients off-loop during unload while preserving runtime after failed platform unload.
 - Validate config-flow connectivity through the same client, and route volume/dimmer services through coordinator methods.
 

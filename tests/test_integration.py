@@ -344,6 +344,40 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("entry-1", self.hass.data["onkyo_legacy"])
         self.assertEqual(client._closed, [True])
 
+    async def test_homeassistant_stop_cancels_optional_tasks_for_every_zone(self) -> None:
+        class Client:
+            def __init__(self):
+                self.closed = False
+
+            def begin_close(self):
+                self.closing = True
+
+            def close(self):
+                self.closed = True
+
+        class Coordinator:
+            def __init__(self, client=None):
+                self.client = client
+                self.cancelled = False
+
+            async def async_cancel_optional_refresh(self):
+                self.cancelled = True
+
+        client = Client()
+        runtime = type("Runtime", (), {})()
+        runtime.coordinator = Coordinator(client)
+        zone2 = type("Zone", (), {})()
+        zone2.coordinator = Coordinator()
+        runtime.zones = (runtime, zone2)
+        self.hass.data["onkyo_legacy"] = {"entry": runtime}
+
+        await self.init_module._disconnect_all(self.hass)
+
+        self.assertTrue(runtime.coordinator.cancelled)
+        self.assertTrue(zone2.coordinator.cancelled)
+        self.assertTrue(client.closing)
+        self.assertTrue(client.closed)
+
     async def test_cancelled_unload_waits_for_queued_executor_close(self) -> None:
         runtime = type("Runtime", (), {})()
         close_started = threading.Event()

@@ -237,6 +237,9 @@ async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData)
     """Finish listener, refresh-task, and socket cleanup despite cancellation."""
     client = runtime.coordinator.client
     client.begin_close()
+    zone_runtimes = getattr(runtime, "zones", ()) or (runtime,)
+    for zone_runtime in zone_runtimes:
+        zone_runtime.coordinator._closing = True
 
     async def _cleanup() -> None:
         stop_unsub = getattr(runtime, "stop_listener_unsub", None)
@@ -246,6 +249,12 @@ async def _async_cleanup_runtime(hass: HomeAssistant, runtime: OnkyoRuntimeData)
         if initial_task:
             initial_task.cancel()
             await asyncio.gather(initial_task, return_exceptions=True)
+        for zone_runtime in zone_runtimes:
+            cancel_optional = getattr(
+                zone_runtime.coordinator, "async_cancel_optional_refresh", None
+            )
+            if cancel_optional is not None:
+                await cancel_optional()
         await hass.async_add_executor_job(client.close)
 
     cleanup_task = asyncio.create_task(_cleanup())
@@ -430,12 +439,20 @@ def _resolve_zone_runtime(
 
 
 async def _disconnect_all(hass: HomeAssistant) -> None:
-    clients = [
-        runtime.coordinator.client.close
-        for runtime in hass.data.get(DOMAIN, {}).values()
-    ]
-    for close in clients:
-        await hass.async_add_executor_job(close)
+    runtimes = tuple(hass.data.get(DOMAIN, {}).values())
+    for runtime in runtimes:
+        client = runtime.coordinator.client
+        client.begin_close()
+        zone_runtimes = getattr(runtime, "zones", ()) or (runtime,)
+        for zone_runtime in zone_runtimes:
+            zone_runtime.coordinator._closing = True
+        for zone_runtime in zone_runtimes:
+            cancel_optional = getattr(
+                zone_runtime.coordinator, "async_cancel_optional_refresh", None
+            )
+            if cancel_optional is not None:
+                await cancel_optional()
+        await hass.async_add_executor_job(client.close)
 
 
 async def _async_migrate_main_entity_unique_ids(hass: HomeAssistant, host: str) -> None:

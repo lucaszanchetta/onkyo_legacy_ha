@@ -97,6 +97,195 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "HDO",
         ))
 
+    async def test_operation_gate_prioritizes_controls_and_bounds_background_wait(self) -> None:
+        gate = self.module._OperationGate()
+        gate.acquire(False)
+        order: list[str] = []
+        threads: list[threading.Thread] = []
+
+        def queued(priority: int, name: str) -> None:
+            gate.acquire(priority)
+            order.append(name)
+            gate.release()
+
+        for index in range(5):
+            thread = threading.Thread(target=queued, args=(2, f"control-{index}"))
+            thread.start()
+            threads.append(thread)
+        core_poll = threading.Thread(target=queued, args=(1, "core"))
+        core_poll.start()
+        threads.append(core_poll)
+        background = threading.Thread(target=queued, args=(0, "background"))
+        background.start()
+        threads.append(background)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with gate._condition:
+                if len(gate._waiters) == 7:
+                    break
+            time.sleep(0.001)
+        gate.release()
+        for thread in threads:
+            thread.join(timeout=1)
+        self.assertEqual(order.index("core"), 4)
+        self.assertEqual(order.index("background"), 6)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    async def test_operation_gate_serves_background_during_sustained_control_and_core_load(self) -> None:
+        gate = self.module._OperationGate()
+        gate.acquire(0)
+        order: list[str] = []
+        threads: list[threading.Thread] = []
+
+        def queued(priority: int, name: str) -> None:
+            gate.acquire(priority)
+            order.append(name)
+            gate.release()
+
+        for index in range(10):
+            for priority, kind in ((2, "control"), (1, "core")):
+                thread = threading.Thread(target=queued, args=(priority, f"{kind}-{index}"))
+                thread.start()
+                threads.append(thread)
+        background = threading.Thread(target=queued, args=(0, "background"))
+        background.start()
+        threads.append(background)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with gate._condition:
+                if len(gate._waiters) == 21:
+                    break
+            time.sleep(0.001)
+        gate.release()
+        for thread in threads:
+            thread.join(timeout=1)
+        self.assertLess(order.index("background"), 15)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    async def test_optional_refresh_cancellation_prevents_late_publish(self) -> None:
+        client = FakeClient({
+            "PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00",
+        })
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("LMD", True)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_optional(command: str, timeout: float = 1.5) -> str:
+            entered.set()
+            release.wait(1)
+            return "LMD00"
+
+        client.query_optional = blocked_optional
+        await coordinator.async_request_refresh()
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        latest = coordinator.data
+        await coordinator.async_cancel_optional_refresh()
+        release.set()
+        coordinator._apply_push_message("MVL30")
+        await asyncio.sleep(0)
+        self.assertIs(coordinator.data, latest)
+
+    async def test_core_batch_keeps_optional_result_published_while_it_waits(self) -> None:
+        client = FakeClient({"PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00"})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original = client.query_batch
+
+        def blocked_batch(commands):
+            if commands != ("PWR",):
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("core query barrier was not released")
+            return original(commands)
+
+        client.query_batch = blocked_batch
+        task = asyncio.create_task(coordinator._async_update_data())
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            coordinator._apply_optional_response("LMD", "LMD00")
+            self.assertEqual(coordinator.data.listening_mode, "stereo")
+        finally:
+            release.set()
+        state = await task
+        self.assertEqual(state.listening_mode, "stereo")
+
+    async def test_shared_multi_zone_gate_runs_control_before_queued_optional(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=1)
+        entered = threading.Event()
+        release = threading.Event()
+        order: list[str] = []
+
+        def optional_query(command, timeout=1.5):
+            order.append(f"optional:{command}:start")
+            if command == "LMD":
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("optional barrier was not released")
+            order.append(f"optional:{command}:done")
+            return command + "00"
+
+        client._query_once = optional_query
+        client._send_once = lambda command, value: order.append(f"control:{command}{value}")
+        main = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Main", update_interval=10,
+        )
+        zone2 = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Zone 2",
+            zone=self.module.ZONE_DEFINITIONS["zone2"], update_interval=10,
+        )
+        main.set_command_capability("LMD", True)
+        main.set_command_capability("SLA", True)
+
+        async def no_refresh():
+            return None
+
+        zone2.async_request_refresh = no_refresh
+        optional_task = asyncio.create_task(main._async_optional_refresh())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        control_task = asyncio.create_task(zone2.async_turn_off())
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(optional_task, control_task)
+        self.assertLess(order.index("control:ZPW00"), order.index("optional:SLA:start"))
+
+    async def test_control_can_use_gate_while_query_waits_between_retries(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        cooldown_waiting = threading.Event()
+        release_retry = threading.Event()
+        attempts: list[int] = []
+        sends: list[tuple[str, str]] = []
+
+        def query(command, timeout=5.0):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("simulated disconnect")
+            return "PWR01"
+
+        def wait_cooldown():
+            cooldown_waiting.set()
+            if not release_retry.wait(2):
+                raise TimeoutError("retry barrier was not released")
+
+        client._query_once = query
+        client._send_once = lambda command, value: sends.append((command, value))
+        client._wait_cooldown = wait_cooldown
+        result: list[str] = []
+        query_thread = threading.Thread(target=lambda: result.append(client.query("PWR")))
+        query_thread.start()
+        self.assertTrue(await asyncio.to_thread(cooldown_waiting.wait, 1))
+        client._circuit_open_until = time.monotonic() - 1
+        client.send("MVL", "UP")
+        release_retry.set()
+        query_thread.join(timeout=2)
+        self.assertEqual(result, ["PWR01"])
+        self.assertEqual(sends, [("MVL", "UP")])
+
     async def test_build_runtime_data_selects_tx8050_profile(self) -> None:
         runtime = self.module.build_runtime_data(
             self.hass,
@@ -249,15 +438,21 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         state = None
         for _ in range(10):
             state = await coordinator._async_update_data()
+            coordinator.data = state
+        if coordinator._optional_task:
+            await coordinator._optional_task
+        for _ in range(20):
+            await coordinator._async_optional_refresh()
+        state = coordinator.data
 
         self.assertTrue(state.power)
         self.assertEqual(state.volume, 0)
         self.assertFalse(state.muted)
         self.assertEqual(state.source, "video3")
-        self.assertIsNone(state.audio_selector)
-        self.assertIsNone(state.listening_mode)
-        self.assertEqual(state.audio_information, {})
-        self.assertEqual(state.video_information, {})
+        self.assertEqual(state.audio_selector, "auto")
+        self.assertIsNotNone(state.listening_mode)
+        self.assertTrue(state.audio_information)
+        self.assertTrue(state.video_information)
         self.assertIn("IFV", client.queried)
         self.assertIn("IFA", client.queried)
 
@@ -287,6 +482,12 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator.data = await coordinator._async_update_data()
         coordinator.data = await coordinator._async_update_data()
         state = await coordinator._async_update_data()
+        coordinator.data = state
+        if coordinator._optional_task:
+            await coordinator._optional_task
+        for _ in range(8):
+            await coordinator._async_optional_refresh()
+        state = coordinator.data
 
         self.assertTrue(state.power)
         self.assertEqual(state.volume, 42)
@@ -327,10 +528,14 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator._optional_failures["DIM"] = (3, time.monotonic() + 3600)
 
         await coordinator.async_set_listening_mode("stereo")
+        if coordinator._optional_task:
+            await coordinator._optional_task
         self.assertEqual(coordinator.data.listening_mode, "stereo")
         self.assertIn("LMD", client.queried)
 
         await coordinator.async_set_dimmer_level("01")
+        if coordinator._optional_task:
+            await coordinator._optional_task
         self.assertEqual(coordinator.data.dimmer_level, "dim")
         self.assertEqual(coordinator.data.listening_mode, "stereo")
         self.assertIn("DIM", client.queried)
@@ -357,6 +562,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         for _ in range(10):
             coordinator.data = await coordinator._async_update_data()
+            if coordinator._optional_task:
+                await coordinator._optional_task
 
         self.assertEqual(coordinator.data.video_information["video_input"], "NEW-INPUT")
         self.assertEqual(coordinator.data.video_information["video_output"], "NEW-OUTPUT")
@@ -392,6 +599,10 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         state = await coordinator._async_update_data()
+        coordinator.data = state
+        if coordinator._optional_task:
+            await coordinator._optional_task
+        state = coordinator.data
 
         self.assertEqual(state.audio_selector, "auto")
         self.assertTrue(state.cinema_filter)
@@ -862,9 +1073,11 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                         return "LMD00"
 
                     client.query_optional = optional
-                    task = asyncio.create_task(coordinator._async_update_data())
+                    state = await coordinator._async_update_data()
+                    coordinator.data = state
                     try:
                         self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                        self.assertEqual(coordinator.data.volume, 16)
                         command = getattr(zone, suffix + "_command")
                         value = {"power": "00", "volume": "1A", "mute": "01", "source": "02"}[suffix]
                         # The same wire push is dispatched to every active zone.
@@ -874,15 +1087,12 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                         pushed_state = coordinator.data
                     finally:
                         release.set()
-                    state = await task
-                    coordinator.async_set_updated_data(state)
-                    self.assertEqual(getattr(state, field_name), expected)
+                    await coordinator._optional_task
                     self.assertEqual(getattr(coordinator.data, field_name), expected)
-                    self.assertEqual(state.power, False if field_name == "power" else True)
-                    self.assertEqual(state.volume, 26 if field_name == "volume" else 16)
-                    self.assertEqual(state.muted, field_name == "muted")
+                    self.assertEqual(coordinator.data.power, False if field_name == "power" else True)
+                    self.assertEqual(coordinator.data.volume, 26 if field_name == "volume" else 16)
+                    self.assertEqual(coordinator.data.muted, field_name == "muted")
                     self.assertIs(sibling.data, sibling_before)
-                    self.assertIsNot(state, pushed_state)
                     # A subsequent poll supersedes the earlier push.
                     later = await coordinator._async_update_data()
                     self.assertTrue(later.power)
@@ -1186,6 +1396,14 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 return self
 
             def __exit__(self, *_args):
+                operation_lock.release()
+
+            def acquire(self, _priority=True):
+                if threading.current_thread().name == "queued-query":
+                    query_waiting.set()
+                operation_lock.acquire()
+
+            def release(self):
                 operation_lock.release()
 
         client._operation_lock = ObservableLock()

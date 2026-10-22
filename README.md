@@ -9,8 +9,8 @@ Custom Home Assistant integration for legacy Onkyo receivers (PR-SC5507, TX-8050
 - **Reconfigure flow** — change host/port post-setup
 - **Extensible model profiles** — built-in profiles for PR-SC5507 and TX-8050, plus a GENERIC profile with automatic capability detection for unknown models
 - **Push/event support** — background listener thread for instant state updates from the receiver, with polling as a safety net
-- **Measured polling** — power is checked first, core state is batched while on, and optional commands are staggered two at a time
-- **Circuit breaker** — exponential backoff retries with automatic recovery after connection failures
+- **Responsive polling** — power and core state publish before optional checks; optional commands run two at a time in a bounded background task
+- **Circuit breaker** — exponential backoff retries with automatic recovery after connection failures; queued controls receive bounded priority over optional polling
 - **Zone 2/3 support** — per-zone power, mute, volume, source, and listening mode controls
 - **Diagnostics** — built-in diagnostics for bug reports (config, state, circuit breaker status)
 - **5 services** — `refresh`, `set_listening_mode`, `set_source`, `set_volume`, `set_dimmer`
@@ -50,6 +50,8 @@ To check what your receiver supports before installing, use the included smoke t
 ```bash
 ./.venv/bin/python scripts/prsc5507_smoke.py --host 192.168.1.23 --model YOUR_MODEL --discover
 ```
+
+Run `python scripts/receiver_scheduling_benchmark.py --runs 3` to measure the client gate against a FIFO baseline with simulated I/O. The benchmark holds one optional transaction in flight, queues another, then measures a control send and its core query. In the recorded run, median send queue/core completion was 45.6/65.7 ms for FIFO versus 25.9/46.1 ms for the priority gate with 20 ms optional responses; with 1.5 s silent responses, it was 3,005.9/3,026.1 ms versus 1,505.8/1,526.0 ms. These timings exercise the client scheduling code with simulated delays; they are not receiver measurements.
 
 ### Known Limitations
 
@@ -173,7 +175,7 @@ Each receiver creates a Home Assistant device with these entities:
 ```
 
 - **Client** — serialized framed eISCP reader with shared capped reconnect cooldown, batch queries, and probes
-- **Coordinator** — `DataUpdateCoordinator` per zone; core polling precedes optional queries, which are staggered while powered on
+- **Coordinator** — `DataUpdateCoordinator` per zone; core polling publishes immediately, while optional queries run in the background and merge onto the latest state
 - **Listener** — background daemon thread for unsolicited ISCP messages (push updates)
 - **Profiles** — `ModelProfile` frozen dataclass with per-model capabilities, sources, and zones
 

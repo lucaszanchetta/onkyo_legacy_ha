@@ -539,6 +539,11 @@ class FakeHass:
         self.created_tasks.append(task)
         return task
 
+    def async_create_background_task(self, coro: Any, name: str) -> Any:
+        task = asyncio.create_task(coro, name=name)
+        self.created_tasks.append(task)
+        return task
+
 
 class FakeConfigEntries:
     def __init__(self) -> None:

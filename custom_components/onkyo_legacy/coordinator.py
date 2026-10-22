@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import select
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from threading import Lock
@@ -47,6 +49,62 @@ _LOGGER = logging.getLogger(__name__)
 
 class CommandResponseTimeout(TimeoutError):
     """A complete query send received no matching response before timeout."""
+
+
+class _OperationGate:
+    """Serialize socket operations while giving queued controls bounded priority."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._waiters: deque[tuple[int, object]] = deque()
+        self._active = False
+        self._high_streak = 0
+        self._core_streak = 0
+
+    def acquire(self, priority: int) -> None:
+        token = object()
+        with self._condition:
+            self._waiters.append((priority, token))
+            while True:
+                controls = [item for item in self._waiters if item[0] == 2]
+                core = [item for item in self._waiters if item[0] == 1]
+                background = [item for item in self._waiters if item[0] == 0]
+                lower = core + background
+                if not self._active:
+                    if controls and (self._high_streak < 4 or not lower):
+                        selected = controls[0]
+                    elif core and (self._core_streak < 4 or not background):
+                        selected = core[0]
+                    elif background:
+                        selected = background[0]
+                    elif core:
+                        selected = core[0]
+                    elif controls:
+                        selected = controls[0]
+                    else:
+                        selected = None
+                    if selected is not None and selected[1] is token:
+                        self._waiters.remove(selected)
+                        self._active = True
+                        self._high_streak = self._high_streak + 1 if priority == 2 else 0
+                        if priority == 1:
+                            self._core_streak += 1
+                        elif priority == 0:
+                            self._core_streak = 0
+                        return
+                self._condition.wait()
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = False
+            self._condition.notify_all()
+
+    def __enter__(self) -> _OperationGate:
+        self.acquire(0)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
 
 def _primary_alias(value: Any) -> str:
@@ -281,7 +339,7 @@ class OnkyoLegacyClient:
         self._listener_stop: threading.Event = threading.Event()
         self._push_callback: Callable[[str], None] | None = None
         self._closed = False
-        self._operation_lock = Lock()
+        self._operation_lock = _OperationGate()
 
     def disconnect(self) -> None:
         """Reset the socket while leaving the listener available."""
@@ -309,11 +367,12 @@ class OnkyoLegacyClient:
 
     def query(self, command: str) -> str:
         """Query a command and return the raw response."""
-        return self._with_retry(self._query_once, command)
+        return self._with_retry(self._query_once, command, priority=False)
 
     def query_optional(self, command: str, timeout: float = 1.5) -> str:
         """Query an optional command once without delaying core polling."""
-        with self._operation_lock:
+        self._operation_lock.acquire(0)
+        try:
             if self._closed:
                 raise ConnectionError("Onkyo client is closed")
             if self._cooldown_remaining():
@@ -326,10 +385,15 @@ class OnkyoLegacyClient:
                 self._record_failure()
                 self._reset_socket()
                 raise
+        finally:
+            self._operation_lock.release()
 
     def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
-        """Query multiple commands in a single lock acquisition."""
-        return self._with_retry(self._query_batch_once, commands)
+        """Query commands in order, yielding the socket gate between responses."""
+        return {
+            command: self._with_retry(self._query_once, command, priority=1)
+            for command in commands
+        }
 
     def probe_commands(self, commands: tuple[str, ...]) -> dict[str, bool]:
         """Probe which commands the receiver responds to.
@@ -351,7 +415,7 @@ class OnkyoLegacyClient:
 
     def send(self, command: str, value: str) -> None:
         """Send a raw command without waiting for an acknowledgement."""
-        self._with_retry(self._send_once, command, value, retry=False)
+        self._with_retry(self._send_once, command, value, retry=False, priority=2)
 
     def _connect(self) -> eISCP:
         if self._closed:
@@ -495,46 +559,36 @@ class OnkyoLegacyClient:
         from eiscp.core import ISCPMessage
         return ISCPMessage.parse(body.decode("utf-8"))
 
-    def _query_batch_once(self, commands: tuple[str, ...]) -> dict[str, str]:
-        with self._lock:
-            device = self._connect()
-            results: dict[str, str] = {}
-            for command in commands:
-                results[command] = self._query_locked(device, command)
-            return results
-
     def _send_once(self, command: str, value: str) -> None:
         with self._lock:
             self._send_packet(self._connect(), f"{command}{value}")
 
-    def _with_retry(self, method: Any, *args: Any, retry: bool = True) -> Any:
-        with self._operation_lock:
-            if self._closed:
-                raise ConnectionError("Onkyo client is closed")
-            if self._cooldown_remaining():
-                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
-            last_error: Exception | None = None
-            attempts = self._retries if retry else 1
-            for attempt in range(attempts):
-                if self._closed:
+    def _with_retry(
+        self, method: Any, *args: Any, retry: bool = True, priority: int = 0
+    ) -> Any:
+        for attempt in range(self._retries if retry else 1):
+            self._operation_lock.acquire(priority)
+            if self._closed or self._cooldown_remaining():
+                closed = self._closed
+                self._operation_lock.release()
+                if closed:
                     raise ConnectionError("Onkyo client is closed")
-                try:
-                    result = method(*args)
-                    self._consecutive_failures = 0
-                    self._circuit_open_until = 0.0
-                    return result
-                except self._RETRYABLE_ERRORS + (ValueError,) as err:
-                    last_error = err
-                    self._record_failure()
-                    _LOGGER.debug(
-                        "ISCP command failed on attempt %s/%s: %s",
-                        attempt + 1, attempts, err,
-                    )
-                    self._reset_socket()
-                    if attempt < attempts - 1:
-                        self._wait_cooldown()
-            assert last_error is not None
-            raise last_error
+                raise ConnectionError(f"Receiver cooldown active for {self._host}:{self._port}")
+            try:
+                result = method(*args)
+                self._consecutive_failures = 0
+                self._circuit_open_until = 0.0
+                return result
+            except self._RETRYABLE_ERRORS + (ValueError,) as err:
+                self._record_failure()
+                _LOGGER.debug("ISCP command failed on attempt %s/%s: %s", attempt + 1, self._retries, err)
+                self._reset_socket()
+                if attempt >= (self._retries if retry else 1) - 1:
+                    raise
+            finally:
+                self._operation_lock.release()
+            self._wait_cooldown()
+        raise AssertionError("retry loop exhausted")
 
     def _record_failure(self) -> None:
         self._consecutive_failures += 1
@@ -622,6 +676,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._optional_failures: dict[str, tuple[int, float]] = {}
         self._priority_optional: list[str] = []
         self._push_revisions = dict.fromkeys(("power", "volume", "muted", "source"), 0)
+        self._optional_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
@@ -648,6 +704,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             raise UpdateFailed(f"Core command {self.zone.power_command} missing from response")
         powered_on = _parse_power(power_raw, self.zone.power_command)
         previous = self.data or OnkyoState()
+        if self._closing:
+            raise asyncio.CancelledError
         if not powered_on:
             return self._merge_newer_pushes(
                 replace(previous, power=False), poll_revisions
@@ -667,6 +725,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             )
         except Exception as err:
             raise UpdateFailed(f"State refresh failed: {err}") from err
+        if self._closing:
+            raise asyncio.CancelledError
 
         for cmd in core_commands:
             if cmd not in results:
@@ -678,119 +738,93 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             muted=_parse_mute(results[self.zone.mute_command], self.zone.mute_command),
             source=_parse_enum(results[self.zone.source_command], self.source_raw_to_name),
         )
-        state.video_information = dict(previous.video_information)
-        # Optional commands can be silent or unsupported. Query them only
-        # while powered on and isolate failures so they cannot starve core
-        # health, power, volume, mute, and source updates.
-        if state.power:
-            optional_commands = tuple(sorted(self._optional_command_set()))
-            if optional_commands:
-                count = min(2, len(optional_commands))
-                start = self._optional_cursor % len(optional_commands)
-                rotated = tuple(
-                    optional_commands[(start + offset) % len(optional_commands)]
-                    for offset in range(count)
+        # Optional queries can finish while this core batch is in flight. Use
+        # the latest snapshot so the core result retains those newer fields.
+        latest = self.data or previous
+        state = _apply_previous_fallbacks(state, latest)
+        self._start_optional_refresh()
+        return self._merge_newer_pushes(state, poll_revisions)
+
+    def _start_optional_refresh(self) -> None:
+        """Keep at most one optional polling task queued or running."""
+        if self._closing or not self._optional_command_set():
+            return
+        if self._optional_task is None or self._optional_task.done():
+            self._optional_task = self.hass.async_create_background_task(
+                self._async_optional_refresh(),
+                name=f"Onkyo optional refresh {self.host} {self.zone.key}",
+            )
+
+    async def async_cancel_optional_refresh(self) -> None:
+        """Stop optional polling during integration cleanup."""
+        self._closing = True
+        task = self._optional_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _async_optional_refresh(self) -> None:
+        """Fetch a small optional batch after core state has been published."""
+        commands = tuple(sorted(self._optional_command_set()))
+        if not commands:
+            return
+        count = min(2, len(commands))
+        start = self._optional_cursor % len(commands)
+        rotated = tuple(commands[(start + offset) % len(commands)] for offset in range(count))
+        self._optional_cursor = (start + count) % len(commands)
+        prioritized = tuple(command for command in self._priority_optional if command in commands)
+        selected = tuple(dict.fromkeys(prioritized + rotated))[:count]
+        for command in selected:
+            failures, retry_at = self._optional_failures.get(command, (0, 0.0))
+            if time.monotonic() < retry_at:
+                continue
+            try:
+                raw = await self.hass.async_add_executor_job(self.client.query_optional, command)
+                self._optional_failures.pop(command, None)
+                if command in self._priority_optional:
+                    self._priority_optional.remove(command)
+                self._apply_optional_response(command, raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug("Optional command %s failed: %s", command, err)
+                failures += 1
+                self._optional_failures[command] = (
+                    failures, time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800)
                 )
-                self._optional_cursor = (start + count) % len(self._optional_command_set())
-                prioritized = tuple(
-                    command
-                    for command in self._priority_optional
-                    if command in optional_commands
-                )
-                optional_commands = tuple(dict.fromkeys(prioritized + rotated))[:count]
-            for command in optional_commands:
-                failures, retry_at = self._optional_failures.get(command, (0, 0.0))
-                if time.monotonic() < retry_at:
-                    continue
-                try:
-                    raw = await self.hass.async_add_executor_job(self.client.query_optional, command)
-                    results[command] = raw
-                    self._optional_failures.pop(command, None)
-                    if command in self._priority_optional:
-                        self._priority_optional.remove(command)
-                except CommandResponseTimeout as err:
-                    _LOGGER.debug("Optional command %s timed out: %s", command, err)
-                    failures += 1
-                    self._optional_failures[command] = (
-                        failures,
-                        time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800),
-                    )
-                    if command in self._priority_optional:
-                        self._priority_optional.remove(command)
-                except Exception as err:
-                    _LOGGER.debug("Optional command %s failed: %s", command, err)
-                    failures += 1
-                    self._optional_failures[command] = (
-                        failures,
-                        time.monotonic() + min(30 * (2 ** min(failures - 1, 6)), 1800),
-                    )
-        if self.zone.key != "main":
-            for command, value_map in _OPTIONAL_MODE_COMMANDS:
-                if command in self.zone.optional_commands and self.supports(command):
-                    raw = results.get(command)
-                    if raw is not None:
-                        setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME))
-            if state.listening_mode is None:
-                state.listening_mode = (self.data or OnkyoState()).listening_mode
-            return self._merge_newer_pushes(state, poll_revisions)
+                if command in self._priority_optional:
+                    self._priority_optional.remove(command)
 
-        for command, value_map in _OPTIONAL_MODE_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME))
-
-        for command, value_map in _OPTIONAL_SWITCH_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_switch(raw, value_map))
-
-        for command in _OPTIONAL_SLEEP_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                state.sleep_minutes = _parse_sleep(raw)
-
-        for command in _OPTIONAL_LEVEL_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_signed_level(raw))
-
-        for command in _OPTIONAL_TUNER_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                state.tuner_frequency = _parse_tuner_frequency(raw)
-
-        for command in _OPTIONAL_INFORMATION_COMMANDS:
-            if not self.supports(command):
-                continue
-            raw = results.get(command)
-            if raw is not None:
-                if command in _SINGLE_VALUE_INFORMATION:
-                    attr_name = _OPTIONAL_ATTR_MAP[command]
-                    existing = getattr(state, attr_name)
-                    existing.update(_INFORMATION_PARSERS[command](raw))
-                else:
-                    attr_name = _OPTIONAL_ATTR_MAP[command]
-                    parsed = _INFORMATION_PARSERS[command](raw)
-                    if attr_name == "video_information":
-                        state.video_information.update(parsed)
-                    else:
-                        setattr(state, attr_name, parsed)
-
-        state = _apply_previous_fallbacks(state, previous)
+    def _apply_optional_response(self, command: str, raw: str) -> None:
+        """Merge one optional response onto the latest state without stale core fields."""
+        state = replace(
+            self.data,
+            audio_information=dict(self.data.audio_information),
+            video_information=dict(self.data.video_information),
+        )
+        if command in dict(_OPTIONAL_MODE_COMMANDS):
+            value_map = dict(_OPTIONAL_MODE_COMMANDS)[command] or LISTENING_RAW_TO_NAME
+            setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map))
+        elif command in dict(_OPTIONAL_SWITCH_COMMANDS):
+            setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_switch(raw, dict(_OPTIONAL_SWITCH_COMMANDS)[command]))
+        elif command == "SLP":
+            state.sleep_minutes = _parse_sleep(raw)
+        elif command in _OPTIONAL_LEVEL_COMMANDS:
+            setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_signed_level(raw))
+        elif command == "TUN":
+            state.tuner_frequency = _parse_tuner_frequency(raw)
+        elif command in _OPTIONAL_INFORMATION_COMMANDS:
+            parsed = _INFORMATION_PARSERS[command](raw)
+            attr = _OPTIONAL_ATTR_MAP[command]
+            if command in _SINGLE_VALUE_INFORMATION or attr == "video_information":
+                getattr(state, attr).update(parsed)
+            else:
+                setattr(state, attr, parsed)
         state.listening_mode = _resolve_listening_mode_display(
             state.listening_mode, state.audio_information
         )
-        return self._merge_newer_pushes(state, poll_revisions)
+        if not self._closing:
+            self.async_set_updated_data(state)
 
     def _merge_newer_pushes(
         self, state: OnkyoState, poll_revisions: dict[str, int]
@@ -910,7 +944,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
     def _apply_push_message(self, message: str) -> None:
         """Apply a listener update on the Home Assistant event loop."""
-        if len(message) < 3:
+        if self._closing or len(message) < 3:
             return
         prefix = message[:3]
 
