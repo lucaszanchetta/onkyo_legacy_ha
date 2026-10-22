@@ -12,7 +12,7 @@ Custom Home Assistant integration for legacy Onkyo receivers (PR-SC5507, TX-8050
 - **Responsive polling** — power and core state publish before optional checks; optional commands run two at a time in a bounded background task
 - **Circuit breaker** — exponential backoff retries with automatic recovery after connection failures; queued controls receive bounded priority over optional polling
 - **Zone 2/3 support** — per-zone power, mute, volume, source, and listening mode controls
-- **Diagnostics** — built-in diagnostics for bug reports (config, state, circuit breaker status)
+- **Diagnostics** — redacted config/state plus bounded client and per-zone timing metrics
 - **5 services** — `refresh`, `set_listening_mode`, `set_source`, `set_volume`, `set_dimmer`
 
 ## Compatibility
@@ -232,6 +232,36 @@ ONKYO_REPORT_SETUP_TIMING=1 ./.venv/bin/python -m pytest -q -s tests/test_integr
 
 In the recorded run, setup returned in 2.238 ms while all ten optional
 commands remained unresolved and the first response was blocked.
+
+### Real Home Assistant and TCP Tests
+
+The pinned test environment exercises the integration against Home Assistant
+2026.10.2 and a localhost ISCP TCP simulator (no receiver hardware is used):
+
+```bash
+uv venv /tmp/onkyo-ha-real-env --python 3.14
+uv pip install --python /tmp/onkyo-ha-real-env/bin/python -r requirements_ha_test.txt
+PYTHONPATH="$PWD" /tmp/onkyo-ha-real-env/bin/python -m pytest -q -o asyncio_mode=auto tests_ha/
+# Print one sanitized end-to-end timing sample from the public lifecycle test:
+ONKYO_REPORT_TCP_TIMING=1 PYTHONPATH="$PWD" /tmp/onkyo-ha-real-env/bin/python -m pytest -q -s -o asyncio_mode=auto tests_ha/test_public_tcp_lifecycle.py
+```
+
+One local simulator run reported 359.845 ms from enabling normal replies after
+a silent period through the forced core refresh/recovered state, with 20
+commands on the simulated wire through recovery. That run recorded 16 matched
+core responses (67.480 ms total, 37.263 ms max), 3 optional responses
+(13.723 ms total, 6.270 ms max), and 2 connection attempts. Test-only query
+timeouts are capped at 150 ms and retry cooldowns are shortened, so these
+numbers demonstrate instrumented simulator behavior and recovery, not receiver
+or normal production timing.
+
+Diagnostics report fixed-size count/total/max/last summaries in milliseconds
+for socket-gate queue waits, successful matched-response latency, and per-zone
+core/optional polling duration. They also include connect/reconnect attempts,
+optional response timeouts, and the age in seconds of the last valid frame and
+last successful matched query. Push frames update valid-frame age only; they
+cannot make the matched-query age look fresh. These summaries retain no sample
+history, receiver address, credentials, or raw monotonic deadline.
 
 ### Optional State Polling Simulation
 

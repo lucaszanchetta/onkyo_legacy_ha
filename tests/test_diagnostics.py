@@ -63,6 +63,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("queryable_commands", result)
         self.assertIn("coordinator_data", result)
         self.assertIn("circuit_breaker", result)
+        self.assertIn("metrics", result)
         self.assertEqual(result["model"], "PR-SC5507")
         self.assertEqual(result["zones"], ["main"])
         self.assertEqual(result["queryable_commands"], ["PWR", "MVL", "AMT", "SLI"])
@@ -81,6 +82,8 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         payload_str = json.dumps(result)
         self.assertNotIn("192.168.1.50", payload_str)
         self.assertNotIn("60128", payload_str)
+        self.assertNotIn("circuit_open_until", payload_str)
+        self.assertIn('"zone_poll_durations"', payload_str)
 
     async def test_diagnostics_includes_queryable_commands(self) -> None:
         runtime = self._make_runtime()

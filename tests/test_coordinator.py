@@ -135,6 +135,29 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.index("background"), 6)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
 
+    async def test_client_metrics_use_fixed_latency_summaries(self) -> None:
+        metrics = self.module.OnkyoLegacyClient("receiver", 60128).metrics
+        workers = [
+            threading.Thread(
+                target=lambda: [
+                    metrics.queue_latency["control"].record(2.5)
+                    for _ in range(50)
+                ]
+            )
+            for _ in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        summary = metrics.snapshot()["queue_latency_ms"]["control"]
+        self.assertEqual(summary["count"], 200)
+        self.assertEqual(summary["total_ms"], 500.0)
+        self.assertEqual(summary["max_ms"], 2.5)
+        self.assertEqual(summary["last_ms"], 2.5)
+        self.assertNotIn("samples", summary)
+
     async def test_operation_gate_serves_background_during_sustained_control_and_core_load(self) -> None:
         gate = self.module._OperationGate()
         gate.acquire(0)

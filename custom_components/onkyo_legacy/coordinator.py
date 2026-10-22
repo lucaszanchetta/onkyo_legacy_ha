@@ -46,6 +46,114 @@ __all__ = [
 _LOGGER = logging.getLogger(__name__)
 
 
+class _LatencySummary:
+    """Fixed-size latency summary with no retained sample history."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.count = 0
+        self.total_ms = 0.0
+        self.max_ms = 0.0
+        self.last_ms: float | None = None
+
+    def record(self, elapsed_ms: float) -> None:
+        value = max(0.0, elapsed_ms)
+        with self._lock:
+            self.count += 1
+            self.total_ms += value
+            self.max_ms = max(self.max_ms, value)
+            self.last_ms = value
+
+    def snapshot(self) -> dict[str, int | float | None]:
+        with self._lock:
+            return {
+                "count": self.count,
+                "total_ms": round(self.total_ms, 3),
+                "max_ms": round(self.max_ms, 3),
+                "last_ms": round(self.last_ms, 3) if self.last_ms is not None else None,
+            }
+
+
+class _ClientMetrics:
+    """Bounded client metrics using only fixed categories and counters."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.queue_latency = {
+            "control": _LatencySummary(),
+            "core": _LatencySummary(),
+            "background": _LatencySummary(),
+        }
+        self.response_latency = {
+            "core": _LatencySummary(),
+            "optional": _LatencySummary(),
+        }
+        self.connect_attempts = 0
+        self.reconnect_attempts = 0
+        self.optional_timeouts = 0
+        self._successful_connections = 0
+        self._last_valid_frame_at: float | None = None
+        self._last_matched_response_at: float | None = None
+
+    def record_queue(self, priority: int, elapsed_ms: float) -> None:
+        category = "control" if priority == 2 else "core" if priority == 1 else "background"
+        self.queue_latency[category].record(elapsed_ms)
+
+    def record_response(self, category: str, elapsed_ms: float) -> None:
+        self.response_latency[category].record(elapsed_ms)
+        now = time.monotonic()
+        with self._lock:
+            self._last_matched_response_at = now
+
+    def record_valid_frame(self) -> None:
+        with self._lock:
+            self._last_valid_frame_at = time.monotonic()
+
+    def record_connect_attempt(self) -> None:
+        with self._lock:
+            self.connect_attempts += 1
+            if self._successful_connections:
+                self.reconnect_attempts += 1
+
+    def record_connection_success(self) -> None:
+        with self._lock:
+            self._successful_connections += 1
+
+    def record_optional_timeout(self) -> None:
+        with self._lock:
+            self.optional_timeouts += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            frame_age = (
+                max(0.0, now - self._last_valid_frame_at)
+                if self._last_valid_frame_at is not None
+                else None
+            )
+            matched_age = (
+                max(0.0, now - self._last_matched_response_at)
+                if self._last_matched_response_at is not None
+                else None
+            )
+            counters = {
+                "connect_attempts": self.connect_attempts,
+                "reconnect_attempts": self.reconnect_attempts,
+                "optional_timeouts": self.optional_timeouts,
+            }
+        return {
+            **counters,
+            "queue_latency_ms": {
+                key: metric.snapshot() for key, metric in self.queue_latency.items()
+            },
+            "matched_response_latency_ms": {
+                key: metric.snapshot() for key, metric in self.response_latency.items()
+            },
+            "last_valid_frame_age_seconds": round(frame_age, 3) if frame_age is not None else None,
+            "last_matched_response_age_seconds": round(matched_age, 3) if matched_age is not None else None,
+        }
+
+
 class CommandResponseTimeout(TimeoutError):
     """A complete query send received no matching response before timeout."""
 
@@ -53,14 +161,16 @@ class CommandResponseTimeout(TimeoutError):
 class _OperationGate:
     """Serialize socket operations while giving queued controls bounded priority."""
 
-    def __init__(self) -> None:
+    def __init__(self, metrics: _ClientMetrics | None = None) -> None:
         self._condition = threading.Condition()
         self._waiters: deque[tuple[int, object]] = deque()
         self._active = False
         self._high_streak = 0
         self._core_streak = 0
+        self._metrics = metrics
 
     def acquire(self, priority: int) -> None:
+        started = time.perf_counter()
         token = object()
         with self._condition:
             self._waiters.append((priority, token))
@@ -92,6 +202,10 @@ class _OperationGate:
                             self._core_streak += 1
                         elif priority == 0:
                             self._core_streak = 0
+                        if self._metrics is not None:
+                            self._metrics.record_queue(
+                                priority, (time.perf_counter() - started) * 1000
+                            )
                         return
                 self._condition.wait()
 
@@ -426,7 +540,9 @@ class OnkyoLegacyClient:
         self._listener_stop: threading.Event = threading.Event()
         self._push_callback: Callable[[str], None] | None = None
         self._closed = False
-        self._operation_lock = _OperationGate()
+        self.metrics = _ClientMetrics()
+        self._operation_lock = _OperationGate(self.metrics)
+        self._query_kind = "core"
 
     def disconnect(self) -> None:
         """Reset the socket while leaving the listener available."""
@@ -466,15 +582,18 @@ class OnkyoLegacyClient:
                 raise ConnectionError(
                     f"Receiver cooldown active for {self._host}:{self._port}"
                 )
+            self._query_kind = "optional"
             try:
                 return self._query_once(command, timeout=timeout)
             except CommandResponseTimeout:
+                self.metrics.record_optional_timeout()
                 raise
             except (OSError, TimeoutError, ConnectionError, ValueError):
                 self._record_failure()
                 self._reset_socket()
                 raise
         finally:
+            self._query_kind = "core"
             self._operation_lock.release()
 
     def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
@@ -528,6 +647,14 @@ class OnkyoLegacyClient:
             self._device = eISCP(self._host, self._port)
         return self._device
 
+    def _ensure_socket_connected(self, device: eISCP) -> None:
+        if device.command_socket is not None:
+            return
+        self.metrics.record_connect_attempt()
+        device._ensure_socket_connected()
+        if device.command_socket is not None:
+            self.metrics.record_connection_success()
+
     def start_listener(self, callback: Callable[[str], None]) -> None:
         """Start background listener thread for unsolicited ISCP messages."""
         if self._closed or self._listener_thread is not None:
@@ -568,7 +695,10 @@ class OnkyoLegacyClient:
                 try:
                     with self._lock:
                         device = self._connect()
+                        self._ensure_socket_connected(device)
                         message = self._read_message(device, 0.2)
+                        if message:
+                            self.metrics.record_valid_frame()
                 except (OSError, TimeoutError, ConnectionError, ValueError) as err:
                     self._record_failure()
                     self._reset_socket()
@@ -592,32 +722,38 @@ class OnkyoLegacyClient:
     def _query_locked(
         self, device: eISCP, command: str, timeout: float = _CONNECT_TIMEOUT
     ) -> str:
+        started = time.perf_counter()
         if self._closed:
             raise ConnectionError("Onkyo client is closed")
         self._send_packet(device, f"{command}QSTN")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._ensure_socket_connected(device)
             message = self._read_message(device, min(0.2, deadline - time.monotonic()))
+            if message:
+                self.metrics.record_valid_frame()
             if message and message[:3] == command:
+                self.metrics.record_response(
+                    self._query_kind, (time.perf_counter() - started) * 1000
+                )
                 return message
             if message and self._push_callback:
                 self._push_callback(message)
         raise CommandResponseTimeout(f"Timeout waiting for {command} response")
 
-    @classmethod
-    def _send_packet(cls, device: eISCP, command: str) -> None:
+    def _send_packet(self, device: eISCP, command: str) -> None:
         from eiscp.core import command_to_packet
 
         if device.command_socket is None:
             try:
-                device._ensure_socket_connected()
+                self._ensure_socket_connected(device)
             except TimeoutError as err:
                 raise ConnectionError("Timed out connecting to receiver") from err
         sock = device.command_socket
         if sock is None:
             raise ConnectionError("Receiver socket was not established")
         packet = memoryview(command_to_packet(command))
-        deadline = time.monotonic() + cls._CONNECT_TIMEOUT
+        deadline = time.monotonic() + self._CONNECT_TIMEOUT
         while packet:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([], [sock], [], remaining)[1]:
@@ -821,6 +957,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._closing = False
         self._core_poll_succeeded = False
         self._core_poll_completed_at = 0.0
+        self._core_poll_latency_ms = _LatencySummary()
+        self._optional_poll_latency_ms = _LatencySummary()
         self._write_queue: asyncio.Queue[_WriteIntent] = asyncio.Queue()
         self._write_task: asyncio.Task[None] | None = None
         self._pending_absolute_volume: _WriteIntent | None = None
@@ -837,6 +975,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
     def supports(self, command: str) -> bool:
         return self.command_capabilities.get(command, False)
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Return bounded client and coordinator metrics without raw timestamps."""
+        remaining = self.client.cooldown_remaining()
+        return {
+            **self.client.metrics.snapshot(),
+            "core_poll_duration_ms": self._core_poll_latency_ms.snapshot(),
+            "optional_poll_duration_ms": self._optional_poll_latency_ms.snapshot(),
+            "cooldown_remaining_seconds": round(remaining, 3),
+        }
 
     @property
     def core_power_is_fresh(self) -> bool:
@@ -879,6 +1027,13 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         return await self._async_probe_optional(command)
 
     async def _async_update_data(self) -> OnkyoState:
+        started = time.perf_counter()
+        try:
+            return await self._async_fetch_core_state()
+        finally:
+            self._core_poll_latency_ms.record((time.perf_counter() - started) * 1000)
+
+    async def _async_fetch_core_state(self) -> OnkyoState:
         """Fetch the latest state from the device using batched queries."""
         self._core_poll_succeeded = False
         # Query-start boundaries conservatively prefer pushes during that query.
@@ -998,6 +1153,15 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
 
     async def _async_optional_refresh(self) -> None:
+        started = time.perf_counter()
+        try:
+            await self._async_run_optional_refresh()
+        finally:
+            self._optional_poll_latency_ms.record(
+                (time.perf_counter() - started) * 1000
+            )
+
+    async def _async_run_optional_refresh(self) -> None:
         """Fetch a small optional batch after core state has been published."""
         commands = tuple(sorted(self._optional_command_set()))
         if not commands:
