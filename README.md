@@ -233,6 +233,38 @@ ONKYO_REPORT_SETUP_TIMING=1 ./.venv/bin/python -m pytest -q -s tests/test_integr
 In the recorded run, setup returned in 2.238 ms while all ten optional
 commands remained unresolved and the first response was blocked.
 
+### Optional State Polling Simulation
+
+Optional state queries follow active, supported entity contexts. The
+deterministic coordinator tests model these transaction counts: with no active
+optional entities, one refresh issues four core queries and zero optional
+queries; one active main listening-mode select requests `LMD` and its `IFA`
+display dependency (two optional queries total); adding audio-information
+sensors reuses the existing `IFA` transaction, and removing the last listener
+for a command stops future queries. A command already on the wire is allowed to
+finish when its last listener is removed. Push updates are compared before
+publishing, and revisions shared by `LMD` and `IFA` keep stale listening-mode
+displays from replacing newer observations.
+
+Core polling uses a managed fixed-deadline task with the configured scan
+interval, independent of push notifications. A zero interval leaves polling
+manual-only. Optional commands without valid pushes keep their ordinary
+rotating scan cadence. A valid optional push schedules one reconciliation at
+the first-push deadline, at least 60 seconds or six scan intervals later;
+subsequent pushes do not slide that deadline. After that read succeeds, normal
+polling resumes. Stale pushes also stop suppressing reads at the same bounded
+deadline. Tests shorten the interval to 50 ms and verify repeated pushes leave
+the original deadline unchanged, reconciliation runs once it expires, and
+commands without pushes still observe changes on the next scan. Reproduce the
+query-count and push-freshness checks with:
+
+```bash
+./.venv/bin/python -m pytest -q tests/test_coordinator.py -k 'optional_queries_follow_supported_active_entity_contexts or never_pushed_optional_command_keeps_regular_polling_cadence or continuous_push_keeps_fixed_reconciliation_deadline or optional_push'
+```
+
+These are simulated transaction and scheduling checks; they do not measure
+receiver timing or network behavior.
+
 ### Project Structure
 
 ```

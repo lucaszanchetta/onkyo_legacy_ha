@@ -189,6 +189,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _async_remove_unsupported_zone_registry_entries(hass, runtime)
         await _async_remove_stale_entity_registry_entries(hass, runtime.host)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        for zone_runtime in runtime.zones:
+            start_polling = getattr(
+                zone_runtime.coordinator, "async_start_periodic_refresh", None
+            )
+            if start_polling is not None:
+                start_polling()
         _start_discovery_task(hass, runtime)
 
         async def _async_homeassistant_stop(_event) -> None:
@@ -309,6 +315,11 @@ async def _async_discovery_loop(runtime: OnkyoRuntimeData) -> None:
                         runtime.discovery_states[zone.zone_key] = "supported"
                         if all(item.zone_key != zone.zone_key for item in runtime.zones):
                             runtime.zones += (zone,)
+                            start_polling = getattr(
+                                zone.coordinator, "async_start_periodic_refresh", None
+                            )
+                            if start_polling is not None:
+                                start_polling()
                             _propagate_zone_command_capabilities(runtime)
                             _notify_dynamic_entities(runtime)
                     else:

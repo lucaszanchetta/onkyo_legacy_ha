@@ -154,7 +154,10 @@ class OnkyoLegacyDiagnosticSensor(CoordinatorEntity, SensorEntity):
         runtime: OnkyoRuntimeData,
         description: DiagnosticSensorDescription,
     ) -> None:
-        super().__init__(runtime.coordinator)
+        command = description.command or (
+            "IFA" if description.data_attr == "audio_information" else "IFV"
+        )
+        super().__init__(runtime.coordinator, context=frozenset({command}))
         self._runtime = runtime
         self.entity_description = description
         self._attr_name = description.name
@@ -197,7 +200,7 @@ class OnkyoLegacyTunerSensor(CoordinatorEntity, SensorEntity):
     _attr_icon = "mdi:radio"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({"TUN"}))
         self._runtime = runtime
         self._attr_unique_id = f"{runtime.host}-tuner-frequency"
         self._attr_device_info = runtime.device_info

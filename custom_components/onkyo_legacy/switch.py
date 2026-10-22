@@ -68,7 +68,7 @@ class OnkyoLegacySpeakerSwitch(CoordinatorEntity, SwitchEntity):
         command: str,
         state_attr: str,
     ) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({command}))
         self._runtime = runtime
         self._command = command
         self._state_attr = state_attr

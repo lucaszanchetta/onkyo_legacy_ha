@@ -380,13 +380,36 @@ def install_stubs() -> None:
         def __class_getitem__(cls, item: Any) -> type["DataUpdateCoordinator"]:
             return cls
 
-        def __init__(self, hass: Any, logger: Any, name: str, update_interval: Any = None) -> None:
+        def __init__(
+            self,
+            hass: Any,
+            logger: Any,
+            name: str,
+            update_interval: Any = None,
+            always_update: bool = True,
+        ) -> None:
             self.hass = hass
             self.logger = logger
             self.name = name
             self.update_interval = update_interval
+            self.always_update = always_update
             self.data = None
             self.last_update_success = False
+            self._context_listeners: dict[int, Any] = {}
+            self._next_context_listener = 0
+
+        def async_contexts(self):
+            yield from self._context_listeners.values()
+
+        def async_add_listener(self, _callback: Any, context: Any = None):
+            self._next_context_listener += 1
+            listener_id = self._next_context_listener
+            self._context_listeners[listener_id] = context
+
+            def remove_listener() -> None:
+                self._context_listeners.pop(listener_id, None)
+
+            return remove_listener
 
         async def async_refresh(self) -> None:
             self.data = await self._async_update_data()
@@ -400,12 +423,23 @@ def install_stubs() -> None:
             self.last_update_success = True
 
     class CoordinatorEntity:
-        def __init__(self, coordinator: DataUpdateCoordinator) -> None:
+        def __init__(
+            self, coordinator: DataUpdateCoordinator, context: Any = None
+        ) -> None:
             self.coordinator = coordinator
+            self.context = context
+            self._remove_coordinator_listener = None
             self.entity_id: str | None = None
 
         async def async_added_to_hass(self) -> None:
-            return None
+            self._remove_coordinator_listener = self.coordinator.async_add_listener(
+                lambda: None, self.context
+            )
+
+        async def async_will_remove_from_hass(self) -> None:
+            if self._remove_coordinator_listener is not None:
+                self._remove_coordinator_listener()
+                self._remove_coordinator_listener = None
 
     update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
     update_coordinator.CoordinatorEntity = CoordinatorEntity

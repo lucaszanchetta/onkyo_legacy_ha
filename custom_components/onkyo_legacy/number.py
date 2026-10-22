@@ -78,7 +78,9 @@ class OnkyoLegacyNumber(CoordinatorEntity, NumberEntity):
     def __init__(
         self, runtime: OnkyoRuntimeData, description: NumberDescription
     ) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(
+            runtime.coordinator, context=frozenset({description.command})
+        )
         self._runtime = runtime
         self._description = description
         self._attr_name = description.name

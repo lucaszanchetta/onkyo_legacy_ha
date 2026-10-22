@@ -10,7 +10,6 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
 from threading import Lock
 from typing import Any, Callable
 
@@ -738,10 +737,10 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             hass,
             _LOGGER,
             name=f"{name} {zone.label.lower()} coordinator",
-            update_interval=None
-            if update_interval <= 0
-            else timedelta(seconds=update_interval),
+            update_interval=None,
+            always_update=False,
         )
+        self.scan_interval = max(0, update_interval)
         self.client = client
         self.host = host
         self.device_name = name
@@ -753,8 +752,15 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._optional_cursor = 0
         self._optional_failures: dict[str, tuple[int, float]] = {}
         self._priority_optional: list[str] = []
+        self._optional_reconcile_at: dict[str, float] = {}
+        self._optional_last_push_at: dict[str, float] = {}
+        self._active_optional_commands: set[str] = set()
+        self._optional_reconcile_interval = max(60.0, self.scan_interval * 6)
         self._push_revisions = dict.fromkeys(("power", "volume", "muted", "source"), 0)
         self._optional_task: asyncio.Task[None] | None = None
+        self._poll_task: asyncio.Task[None] | None = None
+        self._optional_push_revisions: dict[str, int] = {}
+        self._listening_revision = 0
         self._closing = False
         self._core_poll_succeeded = False
         self._core_poll_completed_at = 0.0
@@ -770,9 +776,37 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         """Whether the last complete core poll recently confirmed power state."""
         if not self._core_poll_succeeded:
             return False
-        interval = self.update_interval
-        max_age = max(30.0, interval.total_seconds() * 2) if interval else 30.0
+        max_age = max(30.0, self.scan_interval * 2) if self.scan_interval else 30.0
         return time.monotonic() - self._core_poll_completed_at <= max_age
+
+    def async_start_periodic_refresh(self) -> None:
+        """Start fixed-deadline core polling, unaffected by push notifications."""
+        if self.scan_interval <= 0 or self._closing:
+            return
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = self.hass.async_create_background_task(
+                self._async_periodic_refresh(),
+                name=f"Onkyo core refresh {self.host} {self.zone.key}",
+            )
+
+    async def _async_periodic_refresh(self) -> None:
+        """Refresh at fixed deadlines, skipping missed ticks instead of catching up."""
+        interval = float(self.scan_interval)
+        deadline = asyncio.get_running_loop().time() + interval
+        while not self._closing:
+            await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
+            if self._closing:
+                return
+            try:
+                await self.async_refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.debug("Scheduled core refresh failed for %s", self.name)
+            deadline += interval
+            now = asyncio.get_running_loop().time()
+            if deadline <= now:
+                deadline = now + interval
 
     async def async_probe_command(self, command: str) -> bool:
         return await self._async_probe_optional(command)
@@ -856,32 +890,54 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             )
 
     async def async_cancel_optional_refresh(self) -> None:
-        """Stop optional polling during integration cleanup."""
+        """Stop optional and periodic polling during integration cleanup."""
         self._closing = True
-        task = self._optional_task
-        if task is not None and not task.done():
+        tasks = (self._optional_task, self._poll_task)
+        active = tuple(task for task in tasks if task is not None and not task.done())
+        for task in active:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
 
     async def _async_optional_refresh(self) -> None:
         """Fetch a small optional batch after core state has been published."""
         commands = tuple(sorted(self._optional_command_set()))
         if not commands:
             return
-        count = min(2, len(commands))
-        start = self._optional_cursor % len(commands)
-        rotated = tuple(
-            commands[(start + offset) % len(commands)] for offset in range(count)
+        now = time.monotonic()
+        due_commands = tuple(
+            command
+            for command in commands
+            if not (
+                command in self._optional_reconcile_at
+                and now < self._optional_reconcile_at[command]
+                and now - self._optional_last_push_at.get(command, 0.0)
+                < self._optional_reconcile_interval
+            )
         )
-        self._optional_cursor = (start + count) % len(commands)
+        if not due_commands and not self._priority_optional:
+            return
+        count = min(2, len(due_commands))
+        start = self._optional_cursor % len(commands)
+        rotated_commands = tuple(
+            commands[(start + offset) % len(commands)] for offset in range(len(commands))
+        )
+        rotated = tuple(command for command in rotated_commands if command in due_commands)[
+            :count
+        ]
+        self._optional_cursor = (start + max(1, count)) % len(commands)
         prioritized = tuple(
             command for command in self._priority_optional if command in commands
         )
-        selected = tuple(dict.fromkeys(prioritized + rotated))[:count]
+        selected = tuple(dict.fromkeys(prioritized + rotated))[:2]
         for command in selected:
+            if command not in self._optional_command_set():
+                continue
             failures, retry_at = self._optional_failures.get(command, (0, 0.0))
             if time.monotonic() < retry_at:
                 continue
+            push_revision = self._optional_push_revisions.get(command, 0)
+            listening_revision = self._listening_revision
             try:
                 raw = await self.hass.async_add_executor_job(
                     self.client.query_optional, command
@@ -889,7 +945,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 self._optional_failures.pop(command, None)
                 if command in self._priority_optional:
                     self._priority_optional.remove(command)
-                self._apply_optional_response(command, raw)
+                if (
+                    self._optional_push_revisions.get(command, 0) == push_revision
+                    and (
+                        command not in {"LMD", "IFA"}
+                        or self._listening_revision == listening_revision
+                    )
+                ):
+                    self._apply_optional_response(command, raw)
+                    self._optional_reconcile_at.pop(command, None)
+                    self._optional_last_push_at.pop(command, None)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -902,13 +967,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 if command in self._priority_optional:
                     self._priority_optional.remove(command)
 
-    def _apply_optional_response(self, command: str, raw: str) -> None:
-        """Merge one optional response onto the latest state without stale core fields."""
+    def _optional_response_state(self, command: str, raw: str) -> OnkyoState:
+        """Build state after applying one optional response."""
         state = replace(
             self.data,
             audio_information=dict(self.data.audio_information),
             video_information=dict(self.data.video_information),
         )
+        if command == "LMD":
+            # A fresh LMD observation supersedes the display cached by older IFA.
+            state.audio_information.pop("listening_mode", None)
         if command in dict(_OPTIONAL_MODE_COMMANDS):
             value_map = dict(_OPTIONAL_MODE_COMMANDS)[command] or LISTENING_RAW_TO_NAME
             setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map))
@@ -934,7 +1002,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         state.listening_mode = _resolve_listening_mode_display(
             state.listening_mode, state.audio_information
         )
-        if not self._closing:
+        return state
+
+    def _apply_optional_response(self, command: str, raw: str) -> None:
+        """Merge one optional response without notifying unchanged observations."""
+        if self._closing:
+            return
+        state = self._optional_response_state(command, raw)
+        if command in {"LMD", "IFA"}:
+            self._listening_revision += 1
+        if state != self.data or not self.last_update_success:
             self.async_set_updated_data(state)
 
     def _merge_newer_pushes(
@@ -951,32 +1028,57 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         )
 
     def _optional_command_set(self) -> set[str]:
-        """Return the set of optional ISCP commands to query for this zone."""
+        """Return supported optional commands demanded by active entities."""
+        contexts = set()
+        async_contexts = getattr(self, "async_contexts", None)
+        if async_contexts is not None:
+            for context in async_contexts():
+                if isinstance(context, str):
+                    contexts.add(context)
+                elif isinstance(context, (set, frozenset, tuple, list)):
+                    contexts.update(item for item in context if isinstance(item, str))
         commands: set[str] = set()
         if self.zone.key != "main":
             for command in self.zone.optional_commands:
-                if self.supports(command):
+                if command in contexts and self.supports(command):
                     commands.add(command)
+            self._reset_reconcile_deadlines_for_new_demand(commands)
+            commands.update(
+                command
+                for command in self._priority_optional
+                if self.supports(command) and command in self.zone.optional_commands
+            )
             return commands
         for command, _ in _OPTIONAL_MODE_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
         for command, _ in _OPTIONAL_SWITCH_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
         for command in _OPTIONAL_SLEEP_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
         for command in _OPTIONAL_LEVEL_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
         for command in _OPTIONAL_TUNER_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
         for command in _OPTIONAL_INFORMATION_COMMANDS:
-            if self.supports(command):
+            if command in contexts and self.supports(command):
                 commands.add(command)
+        self._reset_reconcile_deadlines_for_new_demand(commands)
+        commands.update(
+            command for command in self._priority_optional if self.supports(command)
+        )
         return commands
+
+    def _reset_reconcile_deadlines_for_new_demand(self, commands: set[str]) -> None:
+        """Make a command query immediately when its first listener appears."""
+        for command in commands - self._active_optional_commands:
+            self._optional_reconcile_at.pop(command, None)
+            self._optional_last_push_at.pop(command, None)
+        self._active_optional_commands = set(commands)
 
     def _query_core_state(self) -> tuple[str, str, str, str]:
         return (
@@ -1062,55 +1164,68 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         if self._closing or len(message) < 3:
             return
         prefix = message[:3]
-
-        updated = False
+        state: OnkyoState | None = None
         if prefix == self.zone.power_command:
-            self.data = OnkyoState(
+            state = OnkyoState(
                 power=_parse_power(message, prefix),
                 volume=self.data.volume,
                 muted=self.data.muted,
                 source=self.data.source,
                 **self._optional_state_dict(),
             )
-            updated = True
         elif prefix == self.zone.volume_command:
-            self.data = OnkyoState(
+            state = OnkyoState(
                 power=self.data.power,
                 volume=_parse_volume(message, prefix),
                 muted=self.data.muted,
                 source=self.data.source,
                 **self._optional_state_dict(),
             )
-            updated = True
         elif prefix == self.zone.mute_command:
-            self.data = OnkyoState(
+            state = OnkyoState(
                 power=self.data.power,
                 volume=self.data.volume,
                 muted=_parse_mute(message, prefix),
                 source=self.data.source,
                 **self._optional_state_dict(),
             )
-            updated = True
         elif prefix == self.zone.source_command:
-            self.data = OnkyoState(
+            state = OnkyoState(
                 power=self.data.power,
                 volume=self.data.volume,
                 muted=self.data.muted,
                 source=_parse_enum(message, self.source_raw_to_name),
                 **self._optional_state_dict(),
             )
-            updated = True
+        elif self.zone.key == "main" and prefix in _OPTIONAL_ATTR_MAP:
+            try:
+                state = self._optional_response_state(prefix, message)
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.debug("Ignoring malformed optional push %s", message)
+                return
+            self._optional_push_revisions[prefix] = (
+                self._optional_push_revisions.get(prefix, 0) + 1
+            )
+            pushed_at = time.monotonic()
+            self._optional_last_push_at[prefix] = pushed_at
+            self._optional_reconcile_at.setdefault(
+                prefix, pushed_at + self._optional_reconcile_interval
+            )
+            if prefix in {"LMD", "IFA"}:
+                self._listening_revision += 1
 
-        if updated:
+        if state is not None:
             field_name = {
                 self.zone.power_command: "power",
                 self.zone.volume_command: "volume",
                 self.zone.mute_command: "muted",
                 self.zone.source_command: "source",
-            }[prefix]
-            self._push_revisions[field_name] += 1
-            _LOGGER.debug("Push update: %s -> %s", prefix, message[3:])
-            self.async_set_updated_data(self.data)
+            }.get(prefix)
+            if field_name is not None:
+                self._push_revisions[field_name] += 1
+            if state != self.data or not self.last_update_success:
+                _LOGGER.debug("Push update: %s -> %s", prefix, message[3:])
+                self.async_set_updated_data(state)
 
     def _optional_state_dict(self) -> dict[str, Any]:
         """Copy optional fields from current state for partial updates."""
@@ -1144,7 +1259,11 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             raise HomeAssistantError(
                 "Onkyo receiver is temporarily unavailable (circuit breaker open)"
             ) from err
-        if command in self._optional_command_set():
+        if (
+            command in _OPTIONAL_ATTR_MAP
+            and self.supports(command)
+            and (self.zone.key == "main" or command in self.zone.optional_commands)
+        ):
             if command in self._priority_optional:
                 self._priority_optional.remove(command)
             self._priority_optional.insert(0, command)

@@ -116,7 +116,10 @@ class OnkyoLegacyListeningModeSelect(CoordinatorEntity, SelectEntity):
         runtime: OnkyoRuntimeData | OnkyoZoneRuntimeData,
         supported_modes: list[str] | None = None,
     ) -> None:
-        super().__init__(runtime.coordinator)
+        dependencies = {"LMD"}
+        if runtime.zone_key == "main":
+            dependencies.add("IFA")
+        super().__init__(runtime.coordinator, context=frozenset(dependencies))
         self._runtime = runtime
         self._supported_modes = supported_modes
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-listening-mode"
@@ -160,7 +163,7 @@ class OnkyoLegacyDimmerSelect(CoordinatorEntity, SelectEntity):
     _attr_icon = "mdi:brightness-6"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({"DIM"}))
         self._runtime = runtime
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-dimmer-level"
         self._attr_options = runtime.supported_dimmer_modes
@@ -193,7 +196,7 @@ class OnkyoLegacyAudioSelectorSelect(CoordinatorEntity, SelectEntity):
     _attr_icon = "mdi:audio-input-rca"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({"SLA"}))
         self._runtime = runtime
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-audio-selector"
         self._attr_options = runtime.supported_audio_selectors
@@ -226,7 +229,7 @@ class OnkyoLegacyLateNightSelect(CoordinatorEntity, SelectEntity):
     _attr_icon = "mdi:weather-night"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({"LTN"}))
         self._runtime = runtime
         self._attr_unique_id = f"{runtime.host}-{runtime.zone_key}-late-night"
         self._attr_options = runtime.supported_late_night_modes
@@ -259,7 +262,7 @@ class OnkyoLegacyAudysseyDynamicVolumeSelect(CoordinatorEntity, SelectEntity):
     _attr_icon = "mdi:volume-high"
 
     def __init__(self, runtime: OnkyoRuntimeData) -> None:
-        super().__init__(runtime.coordinator)
+        super().__init__(runtime.coordinator, context=frozenset({"ADV"}))
         self._runtime = runtime
         self._attr_unique_id = (
             f"{runtime.host}-{runtime.zone_key}-audyssey-dynamic-volume"

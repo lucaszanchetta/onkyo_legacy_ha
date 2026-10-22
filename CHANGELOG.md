@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fetch optional state only for active entities, accept ordered optional pushes, and reconcile on fixed deadlines without redundant state notifications.
 - Preserve newer per-field receiver push updates when polling completes, including standby and secondary zones; keep information dictionaries independent between snapshots.
 - Serialize listener reads and command queries through one framed socket reader; preserve unsolicited updates received during a query and reset connections on partial frames or EOF.
 - Share a capped exponential reconnect cooldown across listener, queries, batches, and probes; send-only writes are not retried.

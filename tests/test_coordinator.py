@@ -52,6 +52,10 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.module = fresh_import("custom_components.onkyo_legacy.coordinator")
         self.hass = FakeHass()
 
+    @staticmethod
+    def demand(coordinator, *commands: str) -> None:
+        coordinator.async_add_listener(lambda: None, frozenset(commands))
+
     async def test_build_runtime_data_accepts_secondary_source_aliases(self) -> None:
         runtime = self.module.build_runtime_data(
             self.hass,
@@ -170,6 +174,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             self.hass, client=client, host="receiver", name="Test", update_interval=10,
         )
         coordinator.set_command_capability("LMD", True)
+        self.demand(coordinator, "LMD")
         entered = threading.Event()
         release = threading.Event()
 
@@ -187,6 +192,284 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator._apply_push_message("MVL30")
         await asyncio.sleep(0)
         self.assertIs(coordinator.data, latest)
+
+    async def test_optional_queries_follow_supported_active_entity_contexts(self) -> None:
+        client = FakeClient({
+            "PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00",
+            "LMD": "LMD00", "IFA": "IFAHDMI 2,PCM,   48kHz, 2.0ch,All Ch Stereo,,",
+        })
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("LMD", True)
+        coordinator.set_command_capability("IFA", True)
+
+        await coordinator.async_request_refresh()
+        if coordinator._optional_task:
+            await coordinator._optional_task
+        self.assertEqual(client.queried, ["PWR", "MVL", "AMT", "SLI"])
+
+        listen_mode_listener = coordinator.async_add_listener(
+            lambda: None, frozenset({"LMD", "IFA"})
+        )
+        audio_sensor_listener = coordinator.async_add_listener(
+            lambda: None, frozenset({"IFA"})
+        )
+        await coordinator.async_request_refresh()
+        if coordinator._optional_task:
+            await coordinator._optional_task
+        self.assertCountEqual(
+            [command for command in client.queried if command in {"LMD", "IFA"}],
+            ["LMD", "IFA"],
+        )
+        self.assertEqual(coordinator._optional_command_set(), {"LMD", "IFA"})
+
+        listen_mode_listener()
+        self.assertEqual(coordinator._optional_command_set(), {"IFA"})
+        audio_sensor_listener()
+        self.assertEqual(coordinator._optional_command_set(), set())
+
+    async def test_never_pushed_optional_command_keeps_regular_polling_cadence(self) -> None:
+        client = FakeClient({})
+        response = ["DIM01"]
+        client.query_optional = lambda command, timeout=1.5: (
+            client.queried.append(command) or response[0]
+        )
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("DIM", True)
+        self.demand(coordinator, "DIM")
+
+        await coordinator._async_optional_refresh()
+        self.assertEqual(coordinator.data.dimmer_level, "dim")
+        self.assertNotIn("DIM", coordinator._optional_reconcile_at)
+
+        response[0] = "DIM02"
+        await coordinator._async_optional_refresh()
+        self.assertEqual(coordinator.data.dimmer_level, "dark")
+        self.assertEqual(client.queried, ["DIM", "DIM"])
+
+    async def test_optional_push_updates_only_changed_state_and_revisions(self) -> None:
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=FakeClient({}),
+            host="receiver",
+            name="Test",
+            update_interval=10,
+        )
+        coordinator.data = self.module.OnkyoState(
+            power=True, audio_information={"listening_mode": "STALE IFA MODE"}
+        )
+        initial_state = coordinator.data
+        notifications = []
+        observed_before_set = []
+        original_set = coordinator.async_set_updated_data
+
+        def capture(data):
+            observed_before_set.append(coordinator.data)
+            notifications.append(data)
+            original_set(data)
+
+        coordinator.async_set_updated_data = capture
+        coordinator._apply_push_message("LMD00")
+        self.assertEqual(coordinator.data.listening_mode, "stereo")
+        self.assertNotIn("listening_mode", coordinator.data.audio_information)
+        self.assertIs(observed_before_set[0], initial_state)
+        self.assertEqual(coordinator._optional_push_revisions["LMD"], 1)
+        coordinator._apply_push_message("LMD00")
+        self.assertEqual(len(notifications), 1)
+
+        coordinator._apply_push_message(
+            "IFAHDMI 2,PCM,   48kHz, 2.0ch,All Ch Stereo,,"
+        )
+        self.assertIn("input_terminal", coordinator.data.audio_information)
+        self.assertEqual(coordinator._optional_push_revisions["IFA"], 1)
+        self.assertEqual(len(notifications), 2)
+        before_optional_response = coordinator.data
+        coordinator._apply_optional_response("SLP", "SLP1E")
+        self.assertIs(observed_before_set[-1], before_optional_response)
+        self.assertEqual(coordinator.data.sleep_minutes, 30)
+
+        zone2 = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=FakeClient({}),
+            host="receiver",
+            name="Zone 2",
+            zone=self.module.ZONE_DEFINITIONS["zone2"],
+            update_interval=10,
+        )
+        zone2.data = self.module.OnkyoState(power=True, listening_mode="zone mode")
+        zone2._apply_push_message("LMD01")
+        self.assertEqual(zone2.data.listening_mode, "zone mode")
+
+    async def test_optional_push_revision_wins_over_older_inflight_query(self) -> None:
+        client = FakeClient({
+            "PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00",
+        })
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("LMD", True)
+        self.demand(coordinator, "LMD")
+        coordinator.data = self.module.OnkyoState(power=True, listening_mode="stereo")
+        notifications = []
+        original_set = coordinator.async_set_updated_data
+
+        def capture(data):
+            notifications.append(data)
+            original_set(data)
+
+        coordinator.async_set_updated_data = capture
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_query(_command, timeout=1.5):
+            entered.set()
+            release.wait(1)
+            return "LMD01"
+
+        client.query_optional = blocked_query
+        await coordinator.async_request_refresh()
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        coordinator._apply_push_message("LMD00")
+        await asyncio.sleep(0)
+        pushed_mode = coordinator.data.listening_mode
+        self.assertEqual(pushed_mode, "stereo")
+        self.assertEqual(notifications, [])
+        release.set()
+        await coordinator._optional_task
+        self.assertEqual(coordinator.data.listening_mode, pushed_mode)
+        self.assertEqual(notifications, [])
+
+    async def test_lmd_push_wins_over_inflight_ifa_display(self) -> None:
+        client = FakeClient({
+            "PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00",
+        })
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("LMD", True)
+        coordinator.set_command_capability("IFA", True)
+        self.demand(coordinator, "LMD", "IFA")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_query(command, timeout=1.5):
+            if command == "IFA":
+                entered.set()
+                release.wait(1)
+                return "IFAHDMI 2,PCM,   48kHz, 2.0ch,All Ch Stereo,,"
+            return "LMD01"
+
+        client.query_optional = blocked_query
+        await coordinator.async_request_refresh()
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        coordinator._apply_push_message("LMD01")
+        await asyncio.sleep(0)
+        pushed_mode = coordinator.data.listening_mode
+        release.set()
+        await coordinator._optional_task
+        self.assertEqual(coordinator.data.listening_mode, pushed_mode)
+        self.assertNotIn("listening_mode", coordinator.data.audio_information)
+
+    async def test_optional_refresh_rechecks_demand_between_transactions(self) -> None:
+        client = FakeClient({})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        for command in ("DIM", "LMD"):
+            coordinator.set_command_capability(command, True)
+        remove_demand = coordinator.async_add_listener(
+            lambda: None, frozenset({"DIM", "LMD"})
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        queried = []
+
+        def blocked_query(command, timeout=1.5):
+            queried.append(command)
+            entered.set()
+            release.wait(1)
+            return command + "00"
+
+        client.query_optional = blocked_query
+        task = asyncio.create_task(coordinator._async_optional_refresh())
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        remove_demand()
+        release.set()
+        await task
+        self.assertEqual(len(queried), 1)
+
+    async def test_continuous_push_keeps_fixed_reconciliation_deadline(self) -> None:
+        client = FakeClient({})
+        client.query_optional = lambda command, timeout=1.5: (
+            client.queried.append(command) or "DIM01"
+        )
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("DIM", True)
+        self.demand(coordinator, "DIM")
+        coordinator._optional_reconcile_interval = 0.05
+        self.assertEqual(coordinator._optional_command_set(), {"DIM"})
+        coordinator._apply_push_message("DIM01")
+        deadline = coordinator._optional_reconcile_at["DIM"]
+
+        for _ in range(5):
+            coordinator._apply_push_message("DIM01")
+            self.assertEqual(coordinator._optional_reconcile_at["DIM"], deadline)
+            await coordinator._async_optional_refresh()
+            self.assertEqual(client.queried, [])
+            await asyncio.sleep(0.01)
+
+        await asyncio.sleep(max(0, deadline - time.monotonic()) + 0.005)
+        await coordinator._async_optional_refresh()
+        self.assertEqual(client.queried, ["DIM"])
+        self.assertNotIn("DIM", coordinator._optional_reconcile_at)
+        self.assertNotIn("DIM", coordinator._optional_last_push_at)
+        await coordinator._async_optional_refresh()
+        self.assertEqual(client.queried, ["DIM", "DIM"])
+
+    async def test_fixed_deadline_refresh_is_independent_of_push_updates(self) -> None:
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=FakeClient({}),
+            host="receiver",
+            name="Test",
+            update_interval=0.02,
+        )
+        calls = 0
+        refreshed = asyncio.Event()
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            refreshed.set()
+
+        coordinator.async_refresh = refresh
+        coordinator.async_start_periodic_refresh()
+        self.assertIsNone(coordinator.update_interval)
+        self.assertFalse(coordinator.always_update)
+        coordinator.data = self.module.OnkyoState(power=True)
+        for index in range(30):
+            coordinator._apply_push_message(f"MVL{index:02X}")
+            await asyncio.sleep(0.001)
+        await asyncio.wait_for(refreshed.wait(), 0.2)
+        self.assertGreaterEqual(calls, 1)
+        await coordinator.async_cancel_optional_refresh()
+        self.assertTrue(coordinator._poll_task.done())
+
+    async def test_zero_scan_interval_stays_manual_only(self) -> None:
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=FakeClient({}),
+            host="receiver",
+            name="Test",
+            update_interval=0,
+        )
+        coordinator.async_start_periodic_refresh()
+        self.assertIsNone(coordinator._poll_task)
 
     async def test_core_batch_keeps_optional_result_published_while_it_waits(self) -> None:
         client = FakeClient({"PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00"})
@@ -241,6 +524,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         main.set_command_capability("LMD", True)
         main.set_command_capability("SLA", True)
+        self.demand(main, "LMD", "SLA")
 
         async def no_refresh():
             return None
@@ -434,6 +718,11 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "IFV",
         ):
             coordinator.set_command_capability(command, True)
+        self.demand(
+            coordinator,
+            "SLA", "LMD", "LTN", "RAS", "ADQ", "ADV", "MOT", "TGA", "TGB",
+            "TGC", "DIM", "SLP", "CTL", "SWL", "IFA", "IFV",
+        )
 
         state = None
         for _ in range(10):
@@ -478,6 +767,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in ("LMD", "DIM", "SLP", "TUN"):
             coordinator.set_command_capability(command, True)
+        self.demand(coordinator, "LMD", "DIM", "SLP", "TUN")
 
         coordinator.data = await coordinator._async_update_data()
         coordinator.data = await coordinator._async_update_data()
@@ -524,8 +814,11 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in self.module.GENERIC_PROFILE.queryable_commands:
             coordinator.set_command_capability(command, True)
+        self.demand(coordinator, *self.module.GENERIC_PROFILE.queryable_commands)
         coordinator._optional_failures["LMD"] = (3, time.monotonic() + 3600)
         coordinator._optional_failures["DIM"] = (3, time.monotonic() + 3600)
+        coordinator._optional_reconcile_at["LMD"] = time.monotonic() + 3600
+        coordinator._optional_reconcile_at["DIM"] = time.monotonic() + 3600
 
         await coordinator.async_set_listening_mode("stereo")
         if coordinator._optional_task:
@@ -539,6 +832,24 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.data.dimmer_level, "dim")
         self.assertEqual(coordinator.data.listening_mode, "stereo")
         self.assertIn("DIM", client.queried)
+
+    async def test_optional_write_requests_confirmation_without_entity_context(self) -> None:
+        client = FakeClient({
+            "PWR": "PWR01", "MVL": "MVL20", "AMT": "AMT00", "SLI": "SLI00",
+            "DIM": "DIM01",
+        })
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        coordinator.set_command_capability("DIM", True)
+        self.assertEqual(coordinator._optional_command_set(), set())
+
+        await coordinator.async_set_dimmer_level("dim")
+        if coordinator._optional_task:
+            await coordinator._optional_task
+
+        self.assertIn("DIM", client.queried)
+        self.assertEqual(coordinator.data.dimmer_level, "dim")
 
     async def test_video_information_merges_across_full_optional_rotation(self) -> None:
         client = FakeClient(
@@ -555,6 +866,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in self.module.GENERIC_PROFILE.queryable_commands:
             coordinator.set_command_capability(command, True)
+        self.demand(coordinator, *self.module.GENERIC_PROFILE.queryable_commands)
         coordinator.data = self.module.OnkyoState(
             power=True,
             video_information={"video_input": "old-input", "custom": "preserve"},
@@ -591,6 +903,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         for command in ("SLA", "RAS", "SLP", "IFA"):
             coordinator.set_command_capability(command, True)
+        self.demand(coordinator, "SLA", "RAS", "SLP", "IFA")
         coordinator.data = self.module.OnkyoState(
             audio_selector="auto",
             cinema_filter=True,
@@ -1063,6 +1376,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     )
                     sibling_before = sibling.data
                     coordinator.set_command_capability("LMD", True)
+                    self.demand(coordinator, "LMD")
                     entered = threading.Event()
                     release = threading.Event()
 

@@ -127,6 +127,31 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entity.source_list, ["VIDEO1", "DVD -- BD/DVD"])
         self.assertAlmostEqual(entity.volume_level, 0.5)
 
+    async def test_optional_entities_register_shared_command_dependencies(self) -> None:
+        runtime = self._runtime()
+        listening = self.select_module.OnkyoLegacyListeningModeSelect(runtime)
+        audio_sensor = self.sensor_module.OnkyoLegacyDiagnosticSensor(
+            runtime, self.sensor_module.SENSOR_DESCRIPTIONS[0]
+        )
+
+        self.assertEqual(listening.context, frozenset({"LMD", "IFA"}))
+        self.assertEqual(audio_sensor.context, frozenset({"IFA"}))
+        self.assertEqual(runtime.coordinator._optional_command_set(), set())
+
+        await listening.async_added_to_hass()
+        self.assertEqual(
+            runtime.coordinator._optional_command_set(), {"LMD", "IFA"}
+        )
+        await audio_sensor.async_added_to_hass()
+        self.assertEqual(
+            runtime.coordinator._optional_command_set(), {"LMD", "IFA"}
+        )
+
+        await listening.async_will_remove_from_hass()
+        self.assertEqual(runtime.coordinator._optional_command_set(), {"IFA"})
+        await audio_sensor.async_will_remove_from_hass()
+        self.assertEqual(runtime.coordinator._optional_command_set(), set())
+
     async def test_media_player_setup_creates_main_entity(self) -> None:
         runtime = self._runtime()
         self.hass.data["onkyo_legacy"] = {"entry-1": runtime}
