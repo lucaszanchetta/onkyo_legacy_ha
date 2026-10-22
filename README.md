@@ -265,6 +265,35 @@ query-count and push-freshness checks with:
 These are simulated transaction and scheduling checks; they do not measure
 receiver timing or network behavior.
 
+### Volume Write Simulation
+
+Volume writes use a per-zone ordered queue. Adjacent absolute targets that are
+still waiting for the shared socket gate collapse to the latest target; the
+target becomes immutable only when the gate grants the transaction. Relative
+steps and other controls form ordering barriers, and writes already claimed by
+the gate are never replaced. A matching fresh volume push confirms an absolute
+write without a read. Otherwise the coordinator makes one bounded query for
+that zone's volume only, merges the observation without replacing newer pushes,
+and reports an error if the receiver returns no numeric volume or a different
+target. Volume writes are sent once because a socket failure can leave delivery
+ambiguous. Other controls are dispatched in queue order without waiting for a
+previous command's refresh or volume-confirmation grace period.
+
+The deterministic gate test queues three absolute targets while another
+transaction holds the gate. It records one `MVL28` write and one targeted `MVL`
+query. Replaying the pre-ZAN-208 behavior for those same three requests would
+record three writes and three full refreshes (four core queries each while the
+receiver is on), for 15 socket transactions total. A matching-push case records
+one write and zero confirmation queries. These are simulator operation counts,
+not receiver latency measurements. The tests also exercise in-flight target
+immutability, relative and unrelated-control barriers, independent zones,
+push confirmation, mismatch and `N/A` responses, stale core batches, ambiguous
+send failure, and shutdown settlement. Reproduce them with:
+
+```bash
+./.venv/bin/python -m pytest -q tests/test_coordinator.py -k 'volume or pending_control_dispatches or late_old_volume'
+```
+
 ### Project Structure
 
 ```

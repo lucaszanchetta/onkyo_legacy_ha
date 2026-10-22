@@ -1140,6 +1140,402 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.module.HomeAssistantError):
             await coordinator._async_send("MVL", "UP")
 
+    async def test_queued_absolute_volume_writes_coalesce_before_gate_grant(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        sent: list[tuple[str, str]] = []
+        queried: list[str] = []
+        client._send_once = lambda command, value: sent.append((command, value))  # type: ignore[method-assign]
+
+        def query(command: str, timeout: float = 5.0) -> str:
+            queried.append(command)
+            return f"{command}{sent[-1][1]}"
+
+        client._query_once = query  # type: ignore[method-assign]
+        gate = client._operation_lock
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold_gate() -> None:
+            gate.acquire(0)
+            acquired.set()
+            release.wait(2)
+            gate.release()
+
+        holder = threading.Thread(target=hold_gate)
+        holder.start()
+        self.assertTrue(await asyncio.to_thread(acquired.wait, 1))
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        calls = [
+            asyncio.create_task(coordinator.async_set_volume(value, 80))
+            for value in (8 / 80, 16 / 80, 40 / 80)
+        ]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with gate._condition:
+                if gate._waiters:
+                    break
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release.set()
+        holder.join(1)
+        await asyncio.gather(*calls)
+        self.assertEqual(sent, [("MVL", "28")])
+        self.assertEqual(queried, ["MVL"])
+
+    async def test_inflight_absolute_is_not_replaced_but_next_burst_coalesces(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        sent: list[tuple[str, str]] = []
+        claimed = threading.Event()
+        release = threading.Event()
+
+        def send(command: str, value: str) -> None:
+            sent.append((command, value))
+            if len(sent) == 1:
+                claimed.set()
+                release.wait(2)
+
+        client._send_once = send  # type: ignore[method-assign]
+        client._query_once = lambda command, timeout=5.0: f"{command}{sent[-1][1]}"  # type: ignore[method-assign]
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        first = asyncio.create_task(coordinator.async_set_volume(8 / 80, 80))
+        self.assertTrue(await asyncio.to_thread(claimed.wait, 1))
+        next_burst = [
+            asyncio.create_task(coordinator.async_set_volume(value, 80))
+            for value in (16 / 80, 40 / 80)
+        ]
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(first, *next_burst)
+        self.assertEqual(sent, [("MVL", "08"), ("MVL", "28")])
+
+    async def test_zone_volume_queues_coalesce_independently(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        sent: list[tuple[str, str]] = []
+        gate = client._operation_lock
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold_gate() -> None:
+            gate.acquire(0)
+            acquired.set()
+            release.wait(2)
+            gate.release()
+
+        client._send_once = lambda command, value: sent.append((command, value))  # type: ignore[method-assign]
+        values = {"MVL": "28", "ZVL": "20"}
+        client._query_once = lambda command, timeout=5.0: f"{command}{values[command]}"  # type: ignore[method-assign]
+        holder = threading.Thread(target=hold_gate)
+        holder.start()
+        self.assertTrue(await asyncio.to_thread(acquired.wait, 1))
+        main = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        zone2 = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="receiver",
+            name="Test",
+            zone=self.module.ZONE_DEFINITIONS["zone2"],
+            update_interval=0,
+        )
+        tasks = [
+            asyncio.create_task(main.async_set_volume(8 / 80, 80)),
+            asyncio.create_task(main.async_set_volume(40 / 80, 80)),
+            asyncio.create_task(zone2.async_set_volume(16 / 80, 80)),
+            asyncio.create_task(zone2.async_set_volume(32 / 80, 80)),
+        ]
+        await asyncio.sleep(0.02)
+        release.set()
+        holder.join(1)
+        await asyncio.gather(*tasks)
+        self.assertCountEqual(sent, [("MVL", "28"), ("ZVL", "20")])
+
+    async def test_failed_volume_send_is_attempted_once(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=3)
+        attempts: list[tuple[str, str]] = []
+
+        def fail(command: str, value: str) -> None:
+            attempts.append((command, value))
+            raise OSError("ambiguous socket failure")
+
+        client._send_once = fail  # type: ignore[method-assign]
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator.async_set_volume(0.25, 80)
+        self.assertEqual(attempts, [("MVL", "14")])
+
+    async def test_pending_control_dispatches_before_volume_confirmation_wait(self) -> None:
+        client = FakeClient({})
+        sent: list[tuple[str, str]] = []
+        query_started = threading.Event()
+        volume_sent = threading.Event()
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        coordinator.async_request_refresh = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+        def send(command: str, value: str) -> None:
+            sent.append((command, value))
+            if command == "MVL":
+                volume_sent.set()
+
+        client.send = send
+        client.query_optional = lambda command, timeout=1.5: (
+            query_started.set() or "MVL14"
+        )
+        volume = asyncio.create_task(coordinator.async_set_volume(0.25, 80))
+        self.assertTrue(await asyncio.to_thread(volume_sent.wait, 1))
+        source = asyncio.create_task(coordinator._async_send("SLI", "12"))
+        await asyncio.wait_for(source, 0.05)
+        self.assertEqual(sent[:2], [("MVL", "14"), ("SLI", "12")])
+        self.assertFalse(query_started.is_set())
+        await volume
+        self.assertTrue(query_started.is_set())
+
+    async def test_volume_dispatches_while_prior_control_refresh_is_blocked(self) -> None:
+        client = FakeClient({})
+        sent: list[tuple[str, str]] = []
+        volume_sent = threading.Event()
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+
+        async def blocked_refresh() -> None:
+            refresh_started.set()
+            await release_refresh.wait()
+
+        coordinator.async_request_refresh = blocked_refresh  # type: ignore[method-assign]
+
+        def send(command: str, value: str) -> None:
+            sent.append((command, value))
+            if command == "MVL":
+                volume_sent.set()
+                self.hass.loop.call_soon_threadsafe(
+                    coordinator._apply_push_message, f"{command}{value}"
+                )
+
+        client.send = send
+        source = asyncio.create_task(coordinator._async_send("SLI", "12"))
+        await asyncio.wait_for(refresh_started.wait(), 1)
+        volume = asyncio.create_task(coordinator.async_set_volume(0.25, 80))
+        self.assertTrue(await asyncio.to_thread(volume_sent.wait, 1))
+        self.assertEqual(sent, [("SLI", "12"), ("MVL", "14")])
+        release_refresh.set()
+        await asyncio.gather(source, volume)
+
+    async def test_late_old_volume_query_cannot_replace_newer_push(self) -> None:
+        client = FakeClient({})
+        sent: list[tuple[str, str]] = []
+        query_started = threading.Event()
+        release_query = threading.Event()
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+
+        def send(command: str, value: str) -> None:
+            sent.append((command, value))
+            if len(sent) == 2:
+                self.hass.loop.call_soon_threadsafe(
+                    coordinator._apply_push_message, "MVL14"
+                )
+
+        def query(command: str, timeout: float = 1.5) -> str:
+            query_started.set()
+            release_query.wait(2)
+            return "MVL08"
+
+        client.send = send
+        client.query_optional = query
+        coordinator._volume_confirmation_grace = 0
+        old_request = asyncio.create_task(coordinator.async_set_volume(8 / 80, 80))
+        self.assertTrue(await asyncio.to_thread(query_started.wait, 1))
+        new_request = asyncio.create_task(coordinator.async_set_volume(20 / 80, 80))
+        await asyncio.wait_for(new_request, 1)
+        release_query.set()
+        await old_request
+        self.assertEqual(sent, [("MVL", "08"), ("MVL", "14")])
+        self.assertEqual(coordinator.data.volume, 20)
+
+    async def test_targeted_volume_observation_wins_over_older_core_batch(self) -> None:
+        core_started = threading.Event()
+        release_core = threading.Event()
+
+        class BlockingClient:
+            sent: list[tuple[str, str]] = []
+
+            def send(self, command: str, value: str) -> None:
+                self.sent.append((command, value))
+
+            def query_optional(self, command: str, timeout: float = 1.5) -> str:
+                return "MVL14"
+
+            def query_batch(self, commands: tuple[str, ...]) -> dict[str, str]:
+                if commands == ("PWR",):
+                    return {"PWR": "PWR01"}
+                core_started.set()
+                release_core.wait(2)
+                return {"MVL": "MVL08", "AMT": "AMT00", "SLI": "SLI00"}
+
+        client = BlockingClient()
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass,
+            client=client,
+            host="receiver",
+            name="Test",
+            update_interval=0,
+        )
+        coordinator.data = self.module.OnkyoState(volume=8)
+        old_refresh = asyncio.create_task(coordinator._async_update_data())
+        self.assertTrue(await asyncio.to_thread(core_started.wait, 1))
+        await coordinator.async_set_volume(20 / 80, 80)
+        self.assertEqual(coordinator.data.volume, 20)
+        release_core.set()
+        returned = await old_refresh
+        self.assertEqual(returned.volume, 20)
+
+    async def test_non_numeric_confirmation_never_claims_volume_success(self) -> None:
+        client = FakeClient({})
+        client.query_optional = lambda command, timeout=1.5: "MVLN/A"
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        coordinator.data = self.module.OnkyoState(volume=20)
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator.async_set_volume(20 / 80, 80)
+        self.assertEqual(coordinator.data.volume, 20)
+
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator.async_volume_step(True)
+        self.assertEqual(client.sent, [
+            ("MVL", "14"),
+            ("MVL", "UP1"),
+        ])
+
+    async def test_volume_relative_and_unrelated_controls_are_queue_barriers(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        sent: list[tuple[str, str]] = []
+        volume = ["08"]
+
+        def send(command: str, value: str) -> None:
+            sent.append((command, value))
+            if command == "MVL" and len(value) == 2:
+                volume[0] = value
+
+        client._send_once = send  # type: ignore[method-assign]
+        client._query_once = lambda command, timeout=5.0: {
+            "PWR": "PWR01",
+            "MVL": f"MVL{volume[0]}",
+            "AMT": "AMT00",
+            "SLI": "SLI00",
+        }[command]  # type: ignore[method-assign]
+        gate = client._operation_lock
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold_gate() -> None:
+            gate.acquire(0)
+            acquired.set()
+            release.wait(2)
+            gate.release()
+
+        holder = threading.Thread(target=hold_gate)
+        holder.start()
+        self.assertTrue(await asyncio.to_thread(acquired.wait, 1))
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        tasks = [
+            asyncio.create_task(coordinator.async_set_volume(8 / 80, 80)),
+            asyncio.create_task(coordinator.async_volume_step(True)),
+            asyncio.create_task(coordinator._async_send("SLI", "12")),
+            asyncio.create_task(coordinator.async_set_volume(40 / 80, 80)),
+        ]
+        await asyncio.sleep(0.02)
+        release.set()
+        holder.join(1)
+        await asyncio.gather(*tasks)
+        self.assertEqual(
+            sent,
+            [("MVL", "08"), ("MVL", "UP1"), ("SLI", "12"), ("MVL", "28")],
+        )
+
+    async def test_matching_volume_push_skips_confirmation_query(self) -> None:
+        client = FakeClient({})
+        queried: list[str] = []
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+
+        def send(command: str, value: str) -> None:
+            client.sent.append((command, value))
+            self.hass.loop.call_soon_threadsafe(
+                coordinator._apply_push_message, f"{command}{value}"
+            )
+
+        client.send = send
+        client.query_optional = lambda command, timeout=1.5: (
+            queried.append(command) or "MVL14"
+        )
+        await coordinator.async_set_volume(0.25, 80)
+        self.assertEqual(client.sent, [("MVL", "14")])
+        self.assertEqual(queried, [])
+        self.assertEqual(coordinator.data.volume, 20)
+
+    async def test_mismatched_volume_query_updates_observed_state_and_fails(self) -> None:
+        client = FakeClient({})
+        queried: list[str] = []
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        coordinator.data = self.module.OnkyoState(volume=5)
+        client.query_optional = lambda command, timeout=1.5: (
+            queried.append(command) or "MVL0A"
+        )
+        with self.assertRaises(self.module.HomeAssistantError):
+            await coordinator.async_set_volume(0.25, 80)
+        self.assertEqual(client.sent, [("MVL", "14")])
+        self.assertEqual(queried, ["MVL"])
+        self.assertEqual(coordinator.data.volume, 10)
+
+    async def test_shutdown_settles_volume_waiter_without_sending_queued_write(self) -> None:
+        client = self.module.OnkyoLegacyClient("receiver", 60128, retries=2)
+        sent: list[tuple[str, str]] = []
+        client._send_once = lambda command, value: sent.append((command, value))  # type: ignore[method-assign]
+        gate = client._operation_lock
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def hold_gate() -> None:
+            gate.acquire(0)
+            acquired.set()
+            release.wait(2)
+            gate.release()
+
+        holder = threading.Thread(target=hold_gate)
+        holder.start()
+        self.assertTrue(await asyncio.to_thread(acquired.wait, 1))
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=0,
+        )
+        caller = asyncio.create_task(coordinator.async_set_volume(0.25, 80))
+        await asyncio.sleep(0.01)
+        coordinator._closing = True
+        client.begin_close()
+        await coordinator.async_cancel_writes()
+        with self.assertRaises(self.module.HomeAssistantError):
+            await caller
+        release.set()
+        holder.join(1)
+        await asyncio.sleep(0.01)
+        self.assertEqual(sent, [])
+
     # ------------------------------------------------------------------
     # ModelProfile and GENERIC_PROFILE tests
     # ------------------------------------------------------------------

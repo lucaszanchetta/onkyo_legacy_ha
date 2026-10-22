@@ -108,6 +108,48 @@ class _OperationGate:
         self.release()
 
 
+class _VolumeWrite:
+    """Mutable absolute target that becomes immutable at socket-gate grant."""
+
+    def __init__(self, value: str, revision: Callable[[], int]) -> None:
+        self._lock = threading.Lock()
+        self._value = value
+        self._revision = revision
+        self.claimed = False
+        self.start_revision = 0
+        self.claimed_value: str | None = None
+
+    def update(self, value: str) -> bool:
+        with self._lock:
+            if self.claimed:
+                return False
+            self._value = value
+            return True
+
+    def claim(self) -> str:
+        with self._lock:
+            self.claimed = True
+            self.start_revision = self._revision()
+            self.claimed_value = self._value
+            return self._value
+
+
+@dataclass
+class _WriteIntent:
+    command: str
+    value: str
+    future: asyncio.Future[None]
+    volume_write: _VolumeWrite | None = None
+    absolute_target: int | None = None
+    waiters: list[asyncio.Future[None]] = field(default_factory=list)
+    sequence: int = 0
+    push_event: asyncio.Event | None = None
+
+    def __post_init__(self) -> None:
+        if not self.waiters:
+            self.waiters.append(self.future)
+
+
 def _primary_alias(value: Any) -> str:
     """Return the primary alias for a command value."""
     if isinstance(value, tuple):
@@ -466,6 +508,19 @@ class OnkyoLegacyClient:
         """Send a raw command without waiting for an acknowledgement."""
         self._with_retry(self._send_once, command, value, retry=False, priority=2)
 
+    def send_volume_write(self, command: str, write: _VolumeWrite) -> None:
+        """Claim the latest pending volume target only after winning the socket gate."""
+        self._with_retry(
+            self._send_claimed_volume_once,
+            command,
+            write,
+            retry=False,
+            priority=2,
+        )
+
+    def _send_claimed_volume_once(self, command: str, write: _VolumeWrite) -> None:
+        self._send_once(command, write.claim())
+
     def _connect(self) -> eISCP:
         if self._closed:
             raise ConnectionError("Onkyo client is closed")
@@ -757,6 +812,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._active_optional_commands: set[str] = set()
         self._optional_reconcile_interval = max(60.0, self.scan_interval * 6)
         self._push_revisions = dict.fromkeys(("power", "volume", "muted", "source"), 0)
+        self._volume_observation_revision = 0
+        self._valid_volume_push_revision = 0
         self._optional_task: asyncio.Task[None] | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._optional_push_revisions: dict[str, int] = {}
@@ -764,6 +821,16 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._closing = False
         self._core_poll_succeeded = False
         self._core_poll_completed_at = 0.0
+        self._write_queue: asyncio.Queue[_WriteIntent] = asyncio.Queue()
+        self._write_task: asyncio.Task[None] | None = None
+        self._pending_absolute_volume: _WriteIntent | None = None
+        self._volume_confirmation_tasks: set[asyncio.Task[None]] = set()
+        self._volume_confirmation_intents: list[_WriteIntent] = []
+        self._write_completion_tasks: set[asyncio.Task[None]] = set()
+        self._write_completion_intents: list[_WriteIntent] = []
+        self._volume_write_sequence = 0
+        self._latest_volume_write_sequence = 0
+        self._volume_confirmation_grace = 0.1
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
@@ -816,7 +883,10 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._core_poll_succeeded = False
         # Query-start boundaries conservatively prefer pushes during that query.
         # Each field uses its own batch boundary, so later polls replace older pushes.
-        poll_revisions = {"power": self._push_revisions["power"]}
+        poll_revisions = {
+            "power": self._push_revisions["power"],
+            "volume_observation": self._volume_observation_revision,
+        }
         try:
             power_results: dict[str, str] = await self.hass.async_add_executor_job(
                 self.client.query_batch, (self.zone.power_command,)
@@ -847,6 +917,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         poll_revisions.update(
             (name, self._push_revisions[name]) for name in ("volume", "muted", "source")
         )
+        poll_revisions["volume_observation"] = self._volume_observation_revision
         try:
             results: dict[str, str] = await self.hass.async_add_executor_job(
                 self.client.query_batch, core_commands
@@ -898,6 +969,33 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+
+    async def async_cancel_writes(self) -> None:
+        """Cancel queued writes and settle all callers during runtime cleanup."""
+        task = self._write_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        confirmation_tasks = tuple(self._volume_confirmation_tasks)
+        for confirmation in confirmation_tasks:
+            confirmation.cancel()
+        if confirmation_tasks:
+            await asyncio.gather(*confirmation_tasks, return_exceptions=True)
+        completion_tasks = tuple(self._write_completion_tasks)
+        for completion in completion_tasks:
+            completion.cancel()
+        if completion_tasks:
+            await asyncio.gather(*completion_tasks, return_exceptions=True)
+        for intent in self._volume_confirmation_intents:
+            self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
+        self._volume_confirmation_intents.clear()
+        for intent in self._write_completion_intents:
+            self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
+        self._write_completion_intents.clear()
+        self._pending_absolute_volume = None
+        while not self._write_queue.empty():
+            intent = self._write_queue.get_nowait()
+            self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
 
     async def _async_optional_refresh(self) -> None:
         """Fetch a small optional batch after core state has been published."""
@@ -1019,6 +1117,10 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
     ) -> OnkyoState:
         """Preserve pushes applied since each field's poll query began."""
         for name, revision in poll_revisions.items():
+            if name == "volume_observation":
+                if self._volume_observation_revision != revision:
+                    state.volume = self.data.volume
+                continue
             if self._push_revisions[name] != revision:
                 setattr(state, name, getattr(self.data, name))
         return replace(
@@ -1174,13 +1276,20 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                 **self._optional_state_dict(),
             )
         elif prefix == self.zone.volume_command:
+            parsed_volume = _parse_volume(message, prefix)
             state = OnkyoState(
                 power=self.data.power,
-                volume=_parse_volume(message, prefix),
+                volume=parsed_volume,
                 muted=self.data.muted,
                 source=self.data.source,
                 **self._optional_state_dict(),
             )
+            self._volume_observation_revision += 1
+            if parsed_volume is not None:
+                self._valid_volume_push_revision += 1
+            for intent in tuple(self._volume_confirmation_intents):
+                if intent.push_event is not None:
+                    intent.push_event.set()
         elif prefix == self.zone.mute_command:
             state = OnkyoState(
                 power=self.data.power,
@@ -1253,22 +1362,253 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         await self._async_send(command, "01" if enabled else "00")
 
     async def _async_send(self, command: str, value: str) -> None:
-        try:
-            await self.hass.async_add_executor_job(self.client.send, command, value)
-        except ConnectionError as err:
-            raise HomeAssistantError(
-                "Onkyo receiver is temporarily unavailable (circuit breaker open)"
-            ) from err
+        if self._closing:
+            raise HomeAssistantError("Onkyo coordinator stopped")
+        future: asyncio.Future[None] = self.hass.loop.create_future()
+        future.add_done_callback(
+            lambda completed: completed.exception()
+            if not completed.cancelled()
+            else None
+        )
+        is_volume = command == self.zone.volume_command
+        absolute = is_volume and len(value) == 2 and all(
+            char in "0123456789ABCDEFabcdef" for char in value
+        )
+        if absolute and self._pending_absolute_volume is not None:
+            pending = self._pending_absolute_volume
+            assert pending.volume_write is not None
+            if pending.volume_write.update(value):
+                pending.absolute_target = int(value, 16)
+                pending.waiters.append(future)
+                await asyncio.shield(future)
+                return
+
+        if is_volume:
+            self._volume_write_sequence += 1
+            write = _VolumeWrite(value, lambda: self._valid_volume_push_revision)
+            intent = _WriteIntent(
+                command,
+                value,
+                future,
+                volume_write=write,
+                absolute_target=int(value, 16) if absolute else None,
+                sequence=self._volume_write_sequence,
+                push_event=asyncio.Event(),
+            )
+            self._latest_volume_write_sequence = intent.sequence
+            self._pending_absolute_volume = intent if absolute else None
+        else:
+            intent = _WriteIntent(command, value, future)
+            self._pending_absolute_volume = None
+        self._write_queue.put_nowait(intent)
+        if self._write_task is None or self._write_task.done():
+            self._write_task = self.hass.async_create_background_task(
+                self._async_write_pump(),
+                name=f"Onkyo write queue {self.host} {self.zone.key}",
+            )
+        await asyncio.shield(future)
+
+    async def _async_write_pump(self) -> None:
+        """Send queued commands in order, coalescing only unclaimed absolutes."""
+        while not self._closing and not self._write_queue.empty():
+            intent = await self._write_queue.get()
+            try:
+                if intent.volume_write is not None:
+                    sender = getattr(self.client, "send_volume_write", None)
+                    if sender is None:
+                        await self.hass.async_add_executor_job(
+                            self.client.send,
+                            intent.command,
+                            intent.volume_write.claim(),
+                        )
+                    else:
+                        await self.hass.async_add_executor_job(
+                            sender, intent.command, intent.volume_write
+                        )
+                    self._volume_confirmation_intents.append(intent)
+                    confirmation = self.hass.async_create_background_task(
+                        self._finish_volume_write(intent),
+                        name=f"Onkyo volume confirmation {self.host} {self.zone.key}",
+                    )
+                    self._volume_confirmation_tasks.add(confirmation)
+                    confirmation.add_done_callback(
+                        self._volume_confirmation_tasks.discard
+                    )
+                    continue
+                else:
+                    await self.hass.async_add_executor_job(
+                        self.client.send, intent.command, intent.value
+                    )
+                    if (
+                        intent.command in _OPTIONAL_ATTR_MAP
+                        and self.supports(intent.command)
+                        and (
+                            self.zone.key == "main"
+                            or intent.command in self.zone.optional_commands
+                        )
+                    ):
+                        if intent.command in self._priority_optional:
+                            self._priority_optional.remove(intent.command)
+                        self._priority_optional.insert(0, intent.command)
+                    self._optional_failures.pop(intent.command, None)
+                    self._write_completion_intents.append(intent)
+                    completion = self.hass.async_create_background_task(
+                        self._finish_nonvolume_write(intent),
+                        name=f"Onkyo write refresh {self.host} {self.zone.key}",
+                    )
+                    self._write_completion_tasks.add(completion)
+                    completion.add_done_callback(self._write_completion_tasks.discard)
+                    continue
+                self._settle_write(intent, None)
+            except asyncio.CancelledError:
+                self._settle_write(
+                    intent, HomeAssistantError("Onkyo coordinator stopped")
+                )
+                raise
+            except (ConnectionError, OSError) as err:
+                self._settle_write(
+                    intent,
+                    HomeAssistantError(
+                        "Onkyo receiver is temporarily unavailable (circuit breaker open)"
+                    ),
+                )
+            except Exception as err:
+                self._settle_write(intent, err)
+            finally:
+                if self._pending_absolute_volume is intent:
+                    self._pending_absolute_volume = None
+
+    async def _confirm_volume_write(self, intent: _WriteIntent) -> None:
+        """Confirm an absolute volume target from a push or one targeted query."""
+        write = intent.volume_write
+        assert write is not None
+        target = intent.absolute_target
+        if target is None:
+            return
+        if intent.sequence < self._latest_volume_write_sequence:
+            return
+        if not self._volume_push_matches(write.start_revision, target):
+            await self._wait_for_volume_push(intent, write.start_revision, target)
+        if self._volume_push_matches(write.start_revision, target):
+            return
+        if intent.sequence < self._latest_volume_write_sequence:
+            return
+        await self._query_volume_confirmation(intent, target)
+
+    async def _confirm_relative_volume_write(self, intent: _WriteIntent) -> None:
+        """Confirm relative steps with a fresh observation or a targeted query."""
+        write = intent.volume_write
+        assert write is not None
+        if intent.sequence < self._latest_volume_write_sequence:
+            return
+        if self._valid_volume_push_revision > write.start_revision:
+            return
+        await self._wait_for_volume_push(intent, write.start_revision, None)
+        if self._valid_volume_push_revision > write.start_revision:
+            return
+        await self._query_volume_confirmation(intent, None)
+
+    async def _wait_for_volume_push(
+        self, intent: _WriteIntent, revision: int, target: int | None
+    ) -> None:
+        event = intent.push_event
+        if event is None:
+            return
         if (
-            command in _OPTIONAL_ATTR_MAP
-            and self.supports(command)
-            and (self.zone.key == "main" or command in self.zone.optional_commands)
+            self._valid_volume_push_revision == revision
+            and (target is None or self.data.volume != target)
         ):
-            if command in self._priority_optional:
-                self._priority_optional.remove(command)
-            self._priority_optional.insert(0, command)
-        self._optional_failures.pop(command, None)
-        await self.async_request_refresh()
+            try:
+                await asyncio.wait_for(event.wait(), self._volume_confirmation_grace)
+            except TimeoutError:
+                pass
+
+    async def _finish_volume_write(self, intent: _WriteIntent) -> None:
+        try:
+            if intent.absolute_target is not None:
+                await self._confirm_volume_write(intent)
+            else:
+                await self._confirm_relative_volume_write(intent)
+            self._settle_write(intent, None)
+        except asyncio.CancelledError:
+            self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
+            raise
+        except Exception as err:
+            self._settle_write(intent, err)
+        finally:
+            if intent in self._volume_confirmation_intents:
+                self._volume_confirmation_intents.remove(intent)
+
+    async def _finish_nonvolume_write(self, intent: _WriteIntent) -> None:
+        try:
+            await self.async_request_refresh()
+            self._settle_write(intent, None)
+        except asyncio.CancelledError:
+            self._settle_write(intent, HomeAssistantError("Onkyo coordinator stopped"))
+            raise
+        except Exception as err:
+            self._settle_write(intent, err)
+        finally:
+            if intent in self._write_completion_intents:
+                self._write_completion_intents.remove(intent)
+
+    def _volume_push_matches(self, revision: int, target: int) -> bool:
+        return (
+            self._valid_volume_push_revision > revision
+            and self.data.volume == target
+        )
+
+    async def _query_volume_confirmation(
+        self, intent: _WriteIntent, target: int | None
+    ) -> None:
+        if self._closing:
+            raise HomeAssistantError("Onkyo coordinator stopped")
+        if intent.sequence < self._latest_volume_write_sequence:
+            return
+        revision = self._push_revisions["volume"]
+        try:
+            raw = await self.hass.async_add_executor_job(
+                self.client.query_optional, intent.command, 1.5
+            )
+        except Exception as err:
+            raise HomeAssistantError("Unable to confirm receiver volume") from err
+        if self._closing:
+            raise HomeAssistantError("Onkyo coordinator stopped")
+        observed = _parse_volume(raw, intent.command)
+        if observed is None:
+            raise HomeAssistantError("Receiver returned no numeric volume")
+        fresh_query_observation = (
+            intent.sequence == self._latest_volume_write_sequence
+            and self._push_revisions["volume"] == revision
+        )
+        if fresh_query_observation:
+            self._volume_observation_revision += 1
+            state = replace(self.data, volume=observed)
+            if state != self.data:
+                self.async_set_updated_data(state)
+        if (
+            intent.sequence == self._latest_volume_write_sequence
+            and target is not None
+            and not (
+            (fresh_query_observation and observed == target)
+            or self._volume_push_matches(
+                intent.volume_write.start_revision, target
+            )
+            )
+        ):
+            raise HomeAssistantError(
+                f"Receiver did not confirm requested volume {target}"
+            )
+
+    @staticmethod
+    def _settle_write(intent: _WriteIntent, error: BaseException | None) -> None:
+        for future in intent.waiters:
+            if future.done():
+                continue
+            if error is None:
+                future.set_result(None)
+            else:
+                future.set_exception(error)
 
 
 def build_runtime_data(

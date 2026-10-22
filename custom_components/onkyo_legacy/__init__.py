@@ -249,6 +249,11 @@ async def _async_cleanup_runtime(
             discovery_task.cancel()
             await asyncio.gather(discovery_task, return_exceptions=True)
         for zone_runtime in zone_runtimes:
+            cancel_writes = getattr(
+                zone_runtime.coordinator, "async_cancel_writes", None
+            )
+            if cancel_writes is not None:
+                await cancel_writes()
             cancel_optional = getattr(
                 zone_runtime.coordinator, "async_cancel_optional_refresh", None
             )
