@@ -822,6 +822,141 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(coordinator.data.source, "video3")
 
+    async def test_pushes_during_optional_poll_survive_refresh_per_field_and_zone(self) -> None:
+        for zone_key in ("main", "zone2"):
+            zone = self.module.ZONE_DEFINITIONS[zone_key]
+            for suffix, field_name, expected in (
+                ("power", "power", False),
+                ("volume", "volume", 26),
+                ("mute", "muted", True),
+                ("source", "source", "video3"),
+            ):
+                with self.subTest(zone=zone_key, field=field_name):
+                    client = FakeClient({
+                        zone.power_command: zone.power_command + "01",
+                        zone.volume_command: zone.volume_command + "10",
+                        zone.mute_command: zone.mute_command + "00",
+                        zone.source_command: zone.source_command + "00",
+                        "LMD": "LMD00",
+                    })
+                    coordinator = self.module.OnkyoLegacyCoordinator(
+                        self.hass, client=client, host="receiver", name="Test",
+                        zone=zone, update_interval=10,
+                    )
+                    sibling_zone = self.module.ZONE_DEFINITIONS[
+                        "zone2" if zone_key == "main" else "main"
+                    ]
+                    sibling = self.module.OnkyoLegacyCoordinator(
+                        self.hass, client=client, host="receiver", name="Sibling",
+                        zone=sibling_zone, update_interval=10,
+                    )
+                    sibling_before = sibling.data
+                    coordinator.set_command_capability("LMD", True)
+                    entered = threading.Event()
+                    release = threading.Event()
+
+                    def optional(command, timeout=1.5):
+                        entered.set()
+                        if not release.wait(2):
+                            raise TimeoutError("test barrier was not released")
+                        return "LMD00"
+
+                    client.query_optional = optional
+                    task = asyncio.create_task(coordinator._async_update_data())
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                        command = getattr(zone, suffix + "_command")
+                        value = {"power": "00", "volume": "1A", "mute": "01", "source": "02"}[suffix]
+                        # The same wire push is dispatched to every active zone.
+                        coordinator._handle_push_message(command + value)
+                        sibling._handle_push_message(command + value)
+                        await asyncio.sleep(0)
+                        pushed_state = coordinator.data
+                    finally:
+                        release.set()
+                    state = await task
+                    coordinator.async_set_updated_data(state)
+                    self.assertEqual(getattr(state, field_name), expected)
+                    self.assertEqual(getattr(coordinator.data, field_name), expected)
+                    self.assertEqual(state.power, False if field_name == "power" else True)
+                    self.assertEqual(state.volume, 26 if field_name == "volume" else 16)
+                    self.assertEqual(state.muted, field_name == "muted")
+                    self.assertIs(sibling.data, sibling_before)
+                    self.assertIsNot(state, pushed_state)
+                    # A subsequent poll supersedes the earlier push.
+                    later = await coordinator._async_update_data()
+                    self.assertTrue(later.power)
+                    self.assertEqual(later.volume, 16)
+                    self.assertFalse(later.muted)
+                    self.assertNotEqual(later.source, "video3")
+
+    async def test_later_core_poll_supersedes_push_during_power_query(self) -> None:
+        client = FakeClient({"PWR": "PWR01", "MVL": "MVL10", "AMT": "AMT00", "SLI": "SLI00"})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original = client.query_batch
+
+        def query_batch(commands):
+            if commands == ("PWR",):
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("test barrier was not released")
+            return original(commands)
+
+        client.query_batch = query_batch
+        task = asyncio.create_task(coordinator._async_update_data())
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            coordinator._handle_push_message("MVL1A")
+            coordinator._handle_push_message("PWR00")
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        state = await task
+        self.assertEqual(state.volume, 16)
+        self.assertFalse(state.power)
+
+    async def test_standby_poll_preserves_power_push_and_dictionary_snapshots(self) -> None:
+        client = FakeClient({"PWR": "PWR00"})
+        coordinator = self.module.OnkyoLegacyCoordinator(
+            self.hass, client=client, host="receiver", name="Test", update_interval=10,
+        )
+        before = self.module.OnkyoState(
+            volume=20, audio_information={"format": "PCM"}, video_information={"resolution": "1080p"},
+        )
+        coordinator.data = before
+        entered = threading.Event()
+        release = threading.Event()
+
+        def query_batch(commands):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test barrier was not released")
+            return {"PWR": "PWR00"}
+
+        client.query_batch = query_batch
+        task = asyncio.create_task(coordinator._async_update_data())
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            coordinator._handle_push_message("PWR01")
+            await asyncio.sleep(0)
+            pushed = coordinator.data
+        finally:
+            release.set()
+        state = await task
+        self.assertTrue(state.power)
+        self.assertEqual(state.volume, 20)
+        for name in ("audio_information", "video_information"):
+            self.assertEqual(getattr(state, name), getattr(before, name))
+            self.assertIsNot(getattr(pushed, name), getattr(before, name))
+            self.assertIsNot(getattr(state, name), getattr(pushed, name))
+            getattr(state, name)["new"] = "value"
+            self.assertNotIn("new", getattr(before, name))
+            self.assertNotIn("new", getattr(pushed, name))
+
     async def test_optional_state_dict_preserves_optional_fields(self) -> None:
         """Partial push updates preserve previously-set optional fields."""
         coordinator = self.module.OnkyoLegacyCoordinator(

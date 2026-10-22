@@ -621,6 +621,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         self._optional_cursor = 0
         self._optional_failures: dict[str, tuple[int, float]] = {}
         self._priority_optional: list[str] = []
+        self._push_revisions = dict.fromkeys(("power", "volume", "muted", "source"), 0)
 
     def set_command_capability(self, command: str, supported: bool) -> None:
         self.command_capabilities[command] = supported
@@ -633,6 +634,9 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
 
     async def _async_update_data(self) -> OnkyoState:
         """Fetch the latest state from the device using batched queries."""
+        # Query-start boundaries conservatively prefer pushes during that query.
+        # Each field uses its own batch boundary, so later polls replace older pushes.
+        poll_revisions = {"power": self._push_revisions["power"]}
         try:
             power_results: dict[str, str] = await self.hass.async_add_executor_job(
                 self.client.query_batch, (self.zone.power_command,)
@@ -645,17 +649,17 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         powered_on = _parse_power(power_raw, self.zone.power_command)
         previous = self.data or OnkyoState()
         if not powered_on:
-            return replace(
-                previous,
-                power=False,
-                audio_information=dict(previous.audio_information),
-                video_information=dict(previous.video_information),
+            return self._merge_newer_pushes(
+                replace(previous, power=False), poll_revisions
             )
 
         core_commands = (
             self.zone.volume_command,
             self.zone.mute_command,
             self.zone.source_command,
+        )
+        poll_revisions.update(
+            (name, self._push_revisions[name]) for name in ("volume", "muted", "source")
         )
         try:
             results: dict[str, str] = await self.hass.async_add_executor_job(
@@ -728,7 +732,7 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
                         setattr(state, _OPTIONAL_ATTR_MAP[command], _parse_enum(raw, value_map or LISTENING_RAW_TO_NAME))
             if state.listening_mode is None:
                 state.listening_mode = (self.data or OnkyoState()).listening_mode
-            return state
+            return self._merge_newer_pushes(state, poll_revisions)
 
         for command, value_map in _OPTIONAL_MODE_COMMANDS:
             if not self.supports(command):
@@ -786,7 +790,20 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
         state.listening_mode = _resolve_listening_mode_display(
             state.listening_mode, state.audio_information
         )
-        return state
+        return self._merge_newer_pushes(state, poll_revisions)
+
+    def _merge_newer_pushes(
+        self, state: OnkyoState, poll_revisions: dict[str, int]
+    ) -> OnkyoState:
+        """Preserve pushes applied since each field's poll query began."""
+        for name, revision in poll_revisions.items():
+            if self._push_revisions[name] != revision:
+                setattr(state, name, getattr(self.data, name))
+        return replace(
+            state,
+            audio_information=dict(state.audio_information),
+            video_information=dict(state.video_information),
+        )
 
     def _optional_command_set(self) -> set[str]:
         """Return the set of optional ISCP commands to query for this zone."""
@@ -936,6 +953,13 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             updated = True
 
         if updated:
+            field_name = {
+                self.zone.power_command: "power",
+                self.zone.volume_command: "volume",
+                self.zone.mute_command: "muted",
+                self.zone.source_command: "source",
+            }[prefix]
+            self._push_revisions[field_name] += 1
             _LOGGER.debug("Push update: %s -> %s", prefix, message[3:])
             self.async_set_updated_data(self.data)
 
@@ -957,8 +981,8 @@ class OnkyoLegacyCoordinator(DataUpdateCoordinator[OnkyoState]):
             "center_level": self.data.center_level,
             "subwoofer_level": self.data.subwoofer_level,
             "tuner_frequency": self.data.tuner_frequency,
-            "audio_information": self.data.audio_information,
-            "video_information": self.data.video_information,
+            "audio_information": dict(self.data.audio_information),
+            "video_information": dict(self.data.video_information),
         }
 
     async def async_set_boolean_option(self, command: str, enabled: bool) -> None:

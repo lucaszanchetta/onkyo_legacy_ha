@@ -177,6 +177,10 @@ Each receiver creates a Home Assistant device with these entities:
 - **Listener** — background daemon thread for unsolicited ISCP messages (push updates)
 - **Profiles** — `ModelProfile` frozen dataclass with per-model capabilities, sources, and zones
 
+### Poll and Push Ordering
+
+Each zone tracks push revisions independently for power, volume, mute, and source. A refresh captures a field's revision immediately before starting its query batch. Pushes applied on the Home Assistant loop after that boundary take precedence when the refresh completes. A later query batch can replace an earlier push. Because eISCP has no response identifiers, a push during the same query is conservatively preferred. Power and the other core fields use separate query boundaries. Partial updates and returned snapshots copy the audio/video information dictionaries.
+
 ### Checking Network Retry Traffic
 
 The integration uses TCP unicast to the configured receiver. Repeated TCP reconnects to an unreachable receiver can cause the host to repeat ARP resolution. Validate any change with matched 120-second captures on the Home Assistant host, using the same receiver power states and network conditions before and after:
